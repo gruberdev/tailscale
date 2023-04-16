@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 	"sigs.k8s.io/yaml"
+
 	"tailscale.com/client/tailscale"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -288,6 +289,7 @@ type ServiceReconciler struct {
 type tsClient interface {
 	CreateKey(ctx context.Context, caps tailscale.KeyCapabilities) (string, *tailscale.Key, error)
 	DeleteDevice(ctx context.Context, id string) error
+	Device(ctx context.Context, id string, fields *tailscale.DeviceFieldsOpts) (*tailscale.Device, error)
 }
 
 func childResourceLabels(parent *corev1.Service) map[string]string {
@@ -447,7 +449,7 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return nil
 	}
 
-	_, tsHost, err := a.getDeviceInfo(ctx, svc)
+	id, tsHost, err := a.getDeviceInfo(ctx, svc)
 	if err != nil {
 		return fmt.Errorf("failed to get device ID: %w", err)
 	}
@@ -460,11 +462,17 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		}
 		return nil
 	}
-
+	fieldOpts := tailscale.DeviceAllFields
+	device, err := a.tsClient.Device(ctx, id, fieldOpts)
+	if err != nil {
+		return err
+	}
 	logger.Debugf("setting ingress hostname to %q", tsHost)
+	logger.Debugf("the node tailcale address is %q", device.Addresses[0])
 	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
 		{
 			Hostname: tsHost,
+			IP:       device.Addresses[0],
 		},
 	}
 	if err := a.Status().Update(ctx, svc); err != nil {
