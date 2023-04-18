@@ -471,7 +471,6 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	logger.Debugf("the node tailcale address is %q", device.Addresses[0])
 	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
 		{
-			Hostname: tsHost,
 			IP:       device.Addresses[0],
 		},
 	}
