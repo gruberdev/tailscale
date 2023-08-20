@@ -65,6 +65,7 @@ func TestHostinfoEqual(t *testing.T) {
 		"Cloud",
 		"Userspace",
 		"UserspaceRouter",
+		"Location",
 	}
 	if have := fieldsOf(reflect.TypeOf(Hostinfo{})); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -346,7 +347,7 @@ func TestNodeEqual(t *testing.T) {
 		"Key", "KeyExpiry", "KeySignature", "Machine", "DiscoKey",
 		"Addresses", "AllowedIPs", "Endpoints", "DERP", "Hostinfo",
 		"Created", "Cap", "Tags", "PrimaryRoutes",
-		"LastSeen", "Online", "KeepAlive", "MachineAuthorized",
+		"LastSeen", "Online", "MachineAuthorized",
 		"Capabilities",
 		"UnsignedPeerAPIOnly",
 		"ComputedName", "computedHostIfDifferent", "ComputedNameWithHost",
@@ -570,6 +571,7 @@ func TestNetInfoFields(t *testing.T) {
 		"PreferredDERP",
 		"LinkType",
 		"DERPLatency",
+		"FirewallMode",
 	}
 	if have := fieldsOf(reflect.TypeOf(NetInfo{})); !reflect.DeepEqual(have, handled) {
 		t.Errorf("NetInfo.Clone/BasicallyEqually check might be out of sync\nfields: %q\nhandled: %q\n",

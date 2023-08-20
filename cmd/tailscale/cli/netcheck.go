@@ -19,6 +19,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/portmapper"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
@@ -45,9 +46,13 @@ var netcheckArgs struct {
 }
 
 func runNetcheck(ctx context.Context, args []string) error {
+	logf := logger.WithPrefix(log.Printf, "portmap: ")
+	netMon, err := netmon.New(logf)
+	if err != nil {
+		return err
+	}
 	c := &netcheck.Client{
-		UDPBindAddr: envknob.String("TS_DEBUG_NETCHECK_UDP_BIND"),
-		PortMapper:  portmapper.NewClient(logger.WithPrefix(log.Printf, "portmap: "), nil, nil),
+		PortMapper:  portmapper.NewClient(logf, netMon, nil, nil),
 		UseDNSCache: false, // always resolve, don't cache
 	}
 	if netcheckArgs.verbose {
@@ -59,6 +64,10 @@ func runNetcheck(ctx context.Context, args []string) error {
 
 	if strings.HasPrefix(netcheckArgs.format, "json") {
 		fmt.Fprintln(Stderr, "# Warning: this JSON format is not yet considered a stable interface")
+	}
+
+	if err := c.Standalone(ctx, envknob.String("TS_DEBUG_NETCHECK_UDP_BIND")); err != nil {
+		fmt.Fprintln(Stderr, "netcheck: UDP test failure:", err)
 	}
 
 	dm, err := localClient.CurrentDERPMap(ctx)
@@ -97,7 +106,6 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	var err error
 	switch netcheckArgs.format {
 	case "":
-		break
 	case "json":
 		j, err = json.MarshalIndent(report, "", "\t")
 	case "json-line":

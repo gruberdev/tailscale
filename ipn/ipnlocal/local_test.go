@@ -20,6 +20,7 @@ import (
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -86,46 +87,46 @@ func TestNetworkMapCompare(t *testing.T) {
 		},
 		{
 			"Peers identical",
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{}},
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{}},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{})},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{})},
 			true,
 		},
 		{
 			"Peer list length",
 			// length of Peers list differs
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{{}}},
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{}},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{{}})},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{})},
 			false,
 		},
 		{
 			"Node names identical",
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{{Name: "A"}}},
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{{Name: "A"}}},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{{Name: "A"}})},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{{Name: "A"}})},
 			true,
 		},
 		{
 			"Node names differ",
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{{Name: "A"}}},
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{{Name: "B"}}},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{{Name: "A"}})},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{{Name: "B"}})},
 			false,
 		},
 		{
 			"Node lists identical",
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{node1, node1}},
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{node1, node1}},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{node1, node1})},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{node1, node1})},
 			true,
 		},
 		{
 			"Node lists differ",
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{node1, node1}},
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{node1, node2}},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{node1, node1})},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{node1, node2})},
 			false,
 		},
 		{
 			"Node Users differ",
 			// User field is not checked.
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{{User: 0}}},
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{{User: 1}}},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{{User: 0}})},
+			&netmap.NetworkMap{Peers: nodeViews([]*tailcfg.Node{{User: 1}})},
 			true,
 		},
 	}
@@ -482,7 +483,7 @@ func TestPeerAPIBase(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := peerAPIBase(tt.nm, tt.peer)
+			got := peerAPIBase(tt.nm, tt.peer.View())
 			if got != tt.want {
 				t.Errorf("got %q; want %q", got, tt.want)
 			}
@@ -501,13 +502,16 @@ func TestLazyMachineKeyGeneration(t *testing.T) {
 	tstest.Replace(t, &panicOnMachineKeyGeneration, func() bool { return true })
 
 	var logf logger.Logf = logger.Discard
+	sys := new(tsd.System)
 	store := new(mem.Store)
-	eng, err := wgengine.NewFakeUserspaceEngine(logf, 0)
+	sys.Set(store)
+	eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set)
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
 	t.Cleanup(eng.Close)
-	lb, err := NewLocalBackend(logf, logid.PublicID{}, store, nil, eng, 0)
+	sys.Set(eng)
+	lb, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
@@ -754,7 +758,7 @@ func TestPacketFilterPermitsUnlockedNodes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := packetFilterPermitsUnlockedNodes(tt.peers, tt.filter); got != tt.want {
+			if got := packetFilterPermitsUnlockedNodes(nodeViews(tt.peers), tt.filter); got != tt.want {
 				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})
@@ -765,13 +769,16 @@ func TestPacketFilterPermitsUnlockedNodes(t *testing.T) {
 func TestStatusWithoutPeers(t *testing.T) {
 	logf := tstest.WhileTestRunningLogger(t)
 	store := new(testStateStorage)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, 0)
+	sys := new(tsd.System)
+	sys.Set(store)
+	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set)
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
+	sys.Set(e)
 	t.Cleanup(e.Close)
 
-	b, err := NewLocalBackend(logf, logid.PublicID{}, store, nil, e, 0)
+	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}

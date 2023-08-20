@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"tailscale.com/net/dnscache"
+	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
@@ -66,9 +68,16 @@ type Dialer struct {
 	// If not specified, this defaults to net.Dialer.DialContext.
 	Dialer dnscache.DialContextFunc
 
+	// DNSCache is the caching Resolver used by this Dialer.
+	//
+	// If not specified, a new Resolver is created per attempt.
+	DNSCache *dnscache.Resolver
+
 	// Logf, if set, is a logging function to use; if unset, logs are
 	// dropped.
 	Logf logger.Logf
+
+	NetMon *netmon.Monitor
 
 	// DialPlan, if set, contains instructions from the control server on
 	// how to connect to it. If present, we will try the methods in this
@@ -81,6 +90,10 @@ type Dialer struct {
 	drainFinished        chan struct{}
 	omitCertErrorLogging bool
 	testFallbackDelay    time.Duration
+
+	// tstime.Clock is used instead of time package for methods such as time.Now.
+	// If not specified, will default to tstime.StdClock{}.
+	Clock tstime.Clock
 }
 
 func strDef(v1, v2 string) string {

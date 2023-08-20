@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/util/mak"
 )
 
@@ -30,10 +33,10 @@ func newFunnelCommand(e *serveEnv) *ffcli.Command {
 	return &ffcli.Command{
 		Name:      "funnel",
 		ShortHelp: "Turn on/off Funnel service",
-		ShortUsage: strings.TrimSpace(`
-funnel <serve-port> {on|off}
-  funnel status [--json]
-`),
+		ShortUsage: strings.Join([]string{
+			"funnel <serve-port> {on|off}",
+			"funnel status [--json]",
+		}, "\n  "),
 		LongHelp: strings.Join([]string{
 			"Funnel allows you to publish a 'tailscale serve'",
 			"server publicly, open to the entire internet.",
@@ -80,7 +83,7 @@ func (e *serveEnv) runFunnel(ctx context.Context, args []string) error {
 	if sc == nil {
 		sc = new(ipn.ServeConfig)
 	}
-	st, err := e.getLocalClientStatus(ctx)
+	st, err := e.getLocalClientStatusWithoutPeers(ctx)
 	if err != nil {
 		return fmt.Errorf("getting client status: %w", err)
 	}
@@ -91,9 +94,15 @@ func (e *serveEnv) runFunnel(ctx context.Context, args []string) error {
 	}
 	port := uint16(port64)
 
-	if err := ipn.CheckFunnelAccess(port, st.Self.Capabilities); err != nil {
-		return err
+	if on {
+		// Don't block from turning off existing Funnel if
+		// network configuration/capabilities have changed.
+		// Only block from starting new Funnels.
+		if err := e.verifyFunnelEnabled(ctx, st, port); err != nil {
+			return err
+		}
 	}
+
 	dnsName := strings.TrimSuffix(st.Self.DNSName, ".")
 	hp := ipn.HostPort(dnsName + ":" + strconv.Itoa(int(port)))
 	if on == sc.AllowFunnel[hp] {
@@ -117,6 +126,49 @@ func (e *serveEnv) runFunnel(ctx context.Context, args []string) error {
 	return nil
 }
 
+// verifyFunnelEnabled verifies that the self node is allowed to use Funnel.
+//
+// If Funnel is not yet enabled by the current node capabilities,
+// the user is sent through an interactive flow to enable the feature.
+// Once enabled, verifyFunnelEnabled checks that the given port is allowed
+// with Funnel.
+//
+// If an error is reported, the CLI should stop execution and return the error.
+//
+// verifyFunnelEnabled may refresh the local state and modify the st input.
+func (e *serveEnv) verifyFunnelEnabled(ctx context.Context, st *ipnstate.Status, port uint16) error {
+	hasFunnelAttrs := func(attrs []string) bool {
+		hasHTTPS := slices.Contains(attrs, tailcfg.CapabilityHTTPS)
+		hasFunnel := slices.Contains(attrs, tailcfg.NodeAttrFunnel)
+		return hasHTTPS && hasFunnel
+	}
+	if hasFunnelAttrs(st.Self.Capabilities) {
+		return nil // already enabled
+	}
+	enableErr := e.enableFeatureInteractive(ctx, "funnel", hasFunnelAttrs)
+	st, statusErr := e.getLocalClientStatusWithoutPeers(ctx) // get updated status; interactive flow may block
+	switch {
+	case statusErr != nil:
+		return fmt.Errorf("getting client status: %w", statusErr)
+	case enableErr != nil:
+		// enableFeatureInteractive is a new flow behind a control server
+		// feature flag. If anything caused it to error, fallback to using
+		// the old CheckFunnelAccess call. Likely this domain does not have
+		// the feature flag on.
+		// TODO(sonia,tailscale/corp#10577): Remove this fallback once the
+		// control flag is turned on for all domains.
+		if err := ipn.CheckFunnelAccess(port, st.Self.Capabilities); err != nil {
+			return err
+		}
+	default:
+		// Done with enablement, make sure the requested port is allowed.
+		if err := ipn.CheckFunnelPort(port, st.Self.Capabilities); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // printFunnelWarning prints a warning if the Funnel is on but there is no serve
 // config for its host:port.
 func printFunnelWarning(sc *ipn.ServeConfig) {
@@ -129,7 +181,7 @@ func printFunnelWarning(sc *ipn.ServeConfig) {
 		p, _ := strconv.ParseUint(portStr, 10, 16)
 		if _, ok := sc.TCP[uint16(p)]; !ok {
 			warn = true
-			fmt.Fprintf(os.Stderr, "Warning: funnel=on for %s, but no serve config\n", hp)
+			fmt.Fprintf(os.Stderr, "\nWarning: funnel=on for %s, but no serve config\n", hp)
 		}
 	}
 	if warn {

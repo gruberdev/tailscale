@@ -7,8 +7,10 @@ package hostinfo
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"os"
+	"os/exec"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -139,15 +141,16 @@ func packageTypeCached() string {
 type EnvType string
 
 const (
-	KNative         = EnvType("kn")
-	AWSLambda       = EnvType("lm")
-	Heroku          = EnvType("hr")
-	AzureAppService = EnvType("az")
-	AWSFargate      = EnvType("fg")
-	FlyDotIo        = EnvType("fly")
-	Kubernetes      = EnvType("k8s")
-	DockerDesktop   = EnvType("dde")
-	Replit          = EnvType("repl")
+	KNative            = EnvType("kn")
+	AWSLambda          = EnvType("lm")
+	Heroku             = EnvType("hr")
+	AzureAppService    = EnvType("az")
+	AWSFargate         = EnvType("fg")
+	FlyDotIo           = EnvType("fly")
+	Kubernetes         = EnvType("k8s")
+	DockerDesktop      = EnvType("dde")
+	Replit             = EnvType("repl")
+	HomeAssistantAddOn = EnvType("haao")
 )
 
 var envType atomic.Value // of EnvType
@@ -168,6 +171,7 @@ var (
 	desktopAtomic         atomic.Value // of opt.Bool
 	packagingType         atomic.Value // of string
 	appType               atomic.Value // of string
+	firewallMode          atomic.Value // of string
 )
 
 // SetPushDeviceToken sets the device token for use in Hostinfo updates.
@@ -178,6 +182,9 @@ func SetDeviceModel(model string) { deviceModelAtomic.Store(model) }
 
 // SetOSVersion sets the OS version.
 func SetOSVersion(v string) { osVersionAtomic.Store(v) }
+
+// SetFirewallMode sets the firewall mode for the app.
+func SetFirewallMode(v string) { firewallMode.Store(v) }
 
 // SetPackage sets the packaging type for the app.
 //
@@ -197,6 +204,13 @@ func deviceModel() string {
 
 func pushDeviceToken() string {
 	s, _ := pushDeviceTokenAtomic.Load().(string)
+	return s
+}
+
+// FirewallMode returns the firewall mode for the app.
+// It is empty if unset.
+func FirewallMode() string {
+	s, _ := firewallMode.Load().(string)
 	return s
 }
 
@@ -253,6 +267,9 @@ func getEnvType() EnvType {
 	if inReplit() {
 		return Replit
 	}
+	if inHomeAssistantAddOn() {
+		return HomeAssistantAddOn
+	}
 	return ""
 }
 
@@ -281,7 +298,7 @@ func inContainer() opt.Bool {
 		return nil
 	})
 	lineread.File("/proc/mounts", func(line []byte) error {
-		if mem.Contains(mem.B(line), mem.S("fuse.lxcfs")) {
+		if mem.Contains(mem.B(line), mem.S("lxcfs /proc/cpuinfo fuse.lxcfs")) {
 			ret.Set(true)
 			return io.EOF
 		}
@@ -362,6 +379,13 @@ func inDockerDesktop() bool {
 	return false
 }
 
+func inHomeAssistantAddOn() bool {
+	if os.Getenv("SUPERVISOR_TOKEN") != "" || os.Getenv("HASSIO_TOKEN") != "" {
+		return true
+	}
+	return false
+}
+
 // goArchVar returns the GOARM or GOAMD64 etc value that the binary was built
 // with.
 func goArchVar() string {
@@ -405,7 +429,7 @@ func DisabledEtcAptSource() bool {
 		return false
 	}
 	mod := fi.ModTime()
-	if c, ok := etcAptSrcCache.Load().(etcAptSrcResult); ok && c.mod == mod {
+	if c, ok := etcAptSrcCache.Load().(etcAptSrcResult); ok && c.mod.Equal(mod) {
 		return c.disabled
 	}
 	f, err := os.Open(path)
@@ -433,4 +457,13 @@ func etcAptSourceFileIsDisabled(r io.Reader) bool {
 		return false
 	}
 	return disabled
+}
+
+// IsSELinuxEnforcing reports whether SELinux is in "Enforcing" mode.
+func IsSELinuxEnforcing() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	out, _ := exec.Command("getenforce").Output()
+	return string(bytes.TrimSpace(out)) == "Enforcing"
 }

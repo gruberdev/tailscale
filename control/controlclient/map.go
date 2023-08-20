@@ -14,7 +14,6 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/opt"
 	"tailscale.com/types/views"
 	"tailscale.com/wgengine/filter"
 )
@@ -29,11 +28,10 @@ import (
 // one MapRequest).
 type mapSession struct {
 	// Immutable fields.
-	privateNodeKey         key.NodePrivate
-	logf                   logger.Logf
-	vlogf                  logger.Logf
-	machinePubKey          key.MachinePublic
-	keepSharerAndUserSplit bool // see Options.KeepSharerAndUserSplit
+	privateNodeKey key.NodePrivate
+	logf           logger.Logf
+	vlogf          logger.Logf
+	machinePubKey  key.MachinePublic
 
 	// Fields storing state over the course of multiple MapResponses.
 	lastNode               *tailcfg.Node
@@ -90,9 +88,28 @@ func (ms *mapSession) netmapForResponse(resp *tailcfg.MapResponse) *netmap.Netwo
 		ms.lastUserProfile[up.ID] = up
 	}
 
-	if resp.DERPMap != nil {
+	if dm := resp.DERPMap; dm != nil {
 		ms.vlogf("netmap: new map contains DERP map")
-		ms.lastDERPMap = resp.DERPMap
+
+		// Zero-valued fields in a DERPMap mean that we're not changing
+		// anything and are using the previous value(s).
+		if ldm := ms.lastDERPMap; ldm != nil {
+			if dm.Regions == nil {
+				dm.Regions = ldm.Regions
+				dm.OmitDefaultRegions = ldm.OmitDefaultRegions
+			}
+			if dm.HomeParams == nil {
+				dm.HomeParams = ldm.HomeParams
+			} else if oldhh := ldm.HomeParams; oldhh != nil {
+				// Propagate sub-fields of HomeParams
+				hh := dm.HomeParams
+				if hh.RegionScore == nil {
+					hh.RegionScore = oldhh.RegionScore
+				}
+			}
+		}
+
+		ms.lastDERPMap = dm
 	}
 
 	if pf := resp.PacketFilter; pf != nil {
@@ -126,33 +143,18 @@ func (ms *mapSession) netmapForResponse(resp *tailcfg.MapResponse) *netmap.Netwo
 		ms.lastTKAInfo = resp.TKAInfo
 	}
 
-	debug := resp.Debug
-	if debug != nil {
-		if debug.RandomizeClientPort {
-			debug.SetRandomizeClientPort.Set(true)
-		}
-		if debug.ForceBackgroundSTUN {
-			debug.SetForceBackgroundSTUN.Set(true)
-		}
-		copyDebugOptBools(&ms.stickyDebug, debug)
-	} else if ms.stickyDebug != (tailcfg.Debug{}) {
-		debug = new(tailcfg.Debug)
-	}
-	if debug != nil {
-		copyDebugOptBools(debug, &ms.stickyDebug)
-		if !debug.ForceBackgroundSTUN {
-			debug.ForceBackgroundSTUN, _ = ms.stickyDebug.SetForceBackgroundSTUN.Get()
-		}
-		if !debug.RandomizeClientPort {
-			debug.RandomizeClientPort, _ = ms.stickyDebug.SetRandomizeClientPort.Get()
-		}
+	// TODO(bradfitz): now that this is a view, remove some of the defensive
+	// cloning elsewhere in mapSession.
+	peerViews := make([]tailcfg.NodeView, len(resp.Peers))
+	for i, n := range resp.Peers {
+		peerViews[i] = n.View()
 	}
 
 	nm := &netmap.NetworkMap{
 		NodeKey:           ms.privateNodeKey.Public(),
 		PrivateKey:        ms.privateNodeKey,
 		MachineKey:        ms.machinePubKey,
-		Peers:             resp.Peers,
+		Peers:             peerViews,
 		UserProfiles:      make(map[tailcfg.UserID]tailcfg.UserProfile),
 		Domain:            ms.lastDomain,
 		DomainAuditLogID:  ms.lastDomainAuditLogID,
@@ -162,7 +164,6 @@ func (ms *mapSession) netmapForResponse(resp *tailcfg.MapResponse) *netmap.Netwo
 		SSHPolicy:         ms.lastSSHPolicy,
 		CollectServices:   ms.collectServices,
 		DERPMap:           ms.lastDERPMap,
-		Debug:             debug,
 		ControlHealth:     ms.lastHealth,
 		TKAEnabled:        ms.lastTKAInfo != nil && !ms.lastTKAInfo.Disabled,
 	}
@@ -202,11 +203,7 @@ func (ms *mapSession) netmapForResponse(resp *tailcfg.MapResponse) *netmap.Netwo
 	for _, peer := range resp.Peers {
 		peer.InitDisplayNames(magicDNSSuffix)
 		if !peer.Sharer.IsZero() {
-			if ms.keepSharerAndUserSplit {
-				ms.addUserProfile(peer.Sharer)
-			} else {
-				peer.User = peer.Sharer
-			}
+			ms.addUserProfile(peer.Sharer)
 		}
 		ms.addUserProfile(peer.User)
 	}
@@ -288,7 +285,7 @@ func undeltaPeers(mapRes *tailcfg.MapResponse, prev []*tailcfg.Node) {
 		for _, n := range newFull {
 			peerByID[n.ID] = n
 		}
-		now := clockNow()
+		now := clock.Now()
 		for nodeID, seen := range mapRes.PeerSeenChange {
 			if n, ok := peerByID[nodeID]; ok {
 				if seen {
@@ -393,19 +390,4 @@ func filterSelfAddresses(in []netip.Prefix) (ret []netip.Prefix) {
 		}
 		return ret
 	}
-}
-
-func copyDebugOptBools(dst, src *tailcfg.Debug) {
-	copy := func(v *opt.Bool, s opt.Bool) {
-		if s != "" {
-			*v = s
-		}
-	}
-	copy(&dst.DERPRoute, src.DERPRoute)
-	copy(&dst.DisableSubnetsIfPAC, src.DisableSubnetsIfPAC)
-	copy(&dst.DisableUPnP, src.DisableUPnP)
-	copy(&dst.OneCGNATRoute, src.OneCGNATRoute)
-	copy(&dst.SetForceBackgroundSTUN, src.SetForceBackgroundSTUN)
-	copy(&dst.SetRandomizeClientPort, src.SetRandomizeClientPort)
-	copy(&dst.TrimWGConfig, src.TrimWGConfig)
 }

@@ -7,6 +7,9 @@ package unixpkgs
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto"
+	"crypto/rand"
+	"crypto/sha512"
 	"errors"
 	"fmt"
 	"io"
@@ -14,26 +17,27 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/goreleaser/nfpm"
+	"github.com/goreleaser/nfpm/v2"
+	"github.com/goreleaser/nfpm/v2/files"
 	"tailscale.com/release/dist"
 )
 
 type tgzTarget struct {
-	filenameArch string // arch to use in filename instead of deriving from goenv["GOARCH"]
-	goenv        map[string]string
+	filenameArch string // arch to use in filename instead of deriving from goEnv["GOARCH"]
+	goEnv        map[string]string
+	signer       crypto.Signer
 }
 
 func (t *tgzTarget) arch() string {
 	if t.filenameArch != "" {
 		return t.filenameArch
 	}
-	return t.goenv["GOARCH"]
+	return t.goEnv["GOARCH"]
 }
 
 func (t *tgzTarget) os() string {
-	return t.goenv["GOOS"]
+	return t.goEnv["GOOS"]
 }
 
 func (t *tgzTarget) String() string {
@@ -42,18 +46,18 @@ func (t *tgzTarget) String() string {
 
 func (t *tgzTarget) Build(b *dist.Build) ([]string, error) {
 	var filename string
-	if t.goenv["GOOS"] == "linux" {
+	if t.goEnv["GOOS"] == "linux" {
 		// Linux used to be the only tgz architecture, so we didn't put the OS
 		// name in the filename.
 		filename = fmt.Sprintf("tailscale_%s_%s.tgz", b.Version.Short, t.arch())
 	} else {
 		filename = fmt.Sprintf("tailscale_%s_%s_%s.tgz", b.Version.Short, t.os(), t.arch())
 	}
-	ts, err := b.BuildGoBinary("tailscale.com/cmd/tailscale", t.goenv)
+	ts, err := b.BuildGoBinary("tailscale.com/cmd/tailscale", t.goEnv)
 	if err != nil {
 		return nil, err
 	}
-	tsd, err := b.BuildGoBinary("tailscale.com/cmd/tailscaled", t.goenv)
+	tsd, err := b.BuildGoBinary("tailscale.com/cmd/tailscaled", t.goEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -66,12 +70,15 @@ func (t *tgzTarget) Build(b *dist.Build) ([]string, error) {
 		return nil, err
 	}
 	defer f.Close()
-	gw := gzip.NewWriter(f)
+	// Hash the final output we're writing to the file, after tar and gzip
+	// writers did their thing.
+	h := sha512.New()
+	hw := io.MultiWriter(f, h)
+	gw := gzip.NewWriter(hw)
 	defer gw.Close()
 	tw := tar.NewWriter(gw)
 	defer tw.Close()
 
-	buildTime := time.Now()
 	addFile := func(src, dst string, mode int64) error {
 		f, err := os.Open(src)
 		if err != nil {
@@ -86,7 +93,7 @@ func (t *tgzTarget) Build(b *dist.Build) ([]string, error) {
 			Name:    dst,
 			Size:    fi.Size(),
 			Mode:    mode,
-			ModTime: buildTime,
+			ModTime: b.Time,
 			Uid:     0,
 			Gid:     0,
 			Uname:   "root",
@@ -104,7 +111,7 @@ func (t *tgzTarget) Build(b *dist.Build) ([]string, error) {
 		hdr := &tar.Header{
 			Name:    name + "/",
 			Mode:    0755,
-			ModTime: buildTime,
+			ModTime: b.Time,
 			Uid:     0,
 			Gid:     0,
 			Uname:   "root",
@@ -148,23 +155,37 @@ func (t *tgzTarget) Build(b *dist.Build) ([]string, error) {
 		return nil, err
 	}
 
-	return []string{filename}, nil
+	files := []string{filename}
+
+	if t.signer != nil {
+		sig, err := t.signer.Sign(rand.Reader, h.Sum(nil), crypto.SHA512)
+		if err != nil {
+			return nil, err
+		}
+		sigFilename := out + ".sig"
+		if err := os.WriteFile(sigFilename, sig, 0644); err != nil {
+			return nil, err
+		}
+		files = append(files, filename+".sig")
+	}
+
+	return files, nil
 }
 
 type debTarget struct {
-	goenv map[string]string
+	goEnv map[string]string
 }
 
 func (t *debTarget) os() string {
-	return t.goenv["GOOS"]
+	return t.goEnv["GOOS"]
 }
 
 func (t *debTarget) arch() string {
-	return t.goenv["GOARCH"]
+	return t.goEnv["GOARCH"]
 }
 
 func (t *debTarget) String() string {
-	return fmt.Sprintf("linux/%s/deb", t.goenv["GOARCH"])
+	return fmt.Sprintf("linux/%s/deb", t.goEnv["GOARCH"])
 }
 
 func (t *debTarget) Build(b *dist.Build) ([]string, error) {
@@ -172,11 +193,11 @@ func (t *debTarget) Build(b *dist.Build) ([]string, error) {
 		return nil, errors.New("deb only supported on linux")
 	}
 
-	ts, err := b.BuildGoBinary("tailscale.com/cmd/tailscale", t.goenv)
+	ts, err := b.BuildGoBinary("tailscale.com/cmd/tailscale", t.goEnv)
 	if err != nil {
 		return nil, err
 	}
-	tsd, err := b.BuildGoBinary("tailscale.com/cmd/tailscaled", t.goenv)
+	tsd, err := b.BuildGoBinary("tailscale.com/cmd/tailscaled", t.goEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -191,6 +212,31 @@ func (t *debTarget) Build(b *dist.Build) ([]string, error) {
 	}
 
 	arch := debArch(t.arch())
+	contents, err := files.PrepareForPackager(files.Contents{
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      ts,
+			Destination: "/usr/bin/tailscale",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      tsd,
+			Destination: "/usr/sbin/tailscaled",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      filepath.Join(tailscaledDir, "tailscaled.service"),
+			Destination: "/lib/systemd/system/tailscaled.service",
+		},
+		&files.Content{
+			Type:        files.TypeConfigNoReplace,
+			Source:      filepath.Join(tailscaledDir, "tailscaled.defaults"),
+			Destination: "/etc/default/tailscaled",
+		},
+	}, 0, "deb", false)
+	if err != nil {
+		return nil, err
+	}
 	info := nfpm.WithDefaults(&nfpm.Info{
 		Name:        "tailscale",
 		Arch:        arch,
@@ -203,14 +249,7 @@ func (t *debTarget) Build(b *dist.Build) ([]string, error) {
 		Section:     "net",
 		Priority:    "extra",
 		Overridables: nfpm.Overridables{
-			Files: map[string]string{
-				ts:  "/usr/bin/tailscale",
-				tsd: "/usr/sbin/tailscaled",
-				filepath.Join(tailscaledDir, "tailscaled.service"): "/lib/systemd/system/tailscaled.service",
-			},
-			ConfigFiles: map[string]string{
-				filepath.Join(tailscaledDir, "tailscaled.defaults"): "/etc/default/tailscaled",
-			},
+			Contents: contents,
 			Scripts: nfpm.Scripts{
 				PostInstall: filepath.Join(repoDir, "release/deb/debian.postinst.sh"),
 				PreRemove:   filepath.Join(repoDir, "release/deb/debian.prerm.sh"),
@@ -245,15 +284,16 @@ func (t *debTarget) Build(b *dist.Build) ([]string, error) {
 }
 
 type rpmTarget struct {
-	goenv map[string]string
+	goEnv  map[string]string
+	signFn func(io.Reader) ([]byte, error)
 }
 
 func (t *rpmTarget) os() string {
-	return t.goenv["GOOS"]
+	return t.goEnv["GOOS"]
 }
 
 func (t *rpmTarget) arch() string {
-	return t.goenv["GOARCH"]
+	return t.goEnv["GOARCH"]
 }
 
 func (t *rpmTarget) String() string {
@@ -265,11 +305,11 @@ func (t *rpmTarget) Build(b *dist.Build) ([]string, error) {
 		return nil, errors.New("rpm only supported on linux")
 	}
 
-	ts, err := b.BuildGoBinary("tailscale.com/cmd/tailscale", t.goenv)
+	ts, err := b.BuildGoBinary("tailscale.com/cmd/tailscale", t.goEnv)
 	if err != nil {
 		return nil, err
 	}
-	tsd, err := b.BuildGoBinary("tailscale.com/cmd/tailscaled", t.goenv)
+	tsd, err := b.BuildGoBinary("tailscale.com/cmd/tailscaled", t.goEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +324,37 @@ func (t *rpmTarget) Build(b *dist.Build) ([]string, error) {
 	}
 
 	arch := rpmArch(t.arch())
+	contents, err := files.PrepareForPackager(files.Contents{
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      ts,
+			Destination: "/usr/bin/tailscale",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      tsd,
+			Destination: "/usr/sbin/tailscaled",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      filepath.Join(tailscaledDir, "tailscaled.service"),
+			Destination: "/lib/systemd/system/tailscaled.service",
+		},
+		&files.Content{
+			Type:        files.TypeConfigNoReplace,
+			Source:      filepath.Join(tailscaledDir, "tailscaled.defaults"),
+			Destination: "/etc/default/tailscaled",
+		},
+		// SELinux policy on e.g. CentOS 8 forbids writing to /var/cache.
+		// Creating an empty directory at install time resolves this issue.
+		&files.Content{
+			Type:        files.TypeDir,
+			Destination: "/var/cache/tailscale",
+		},
+	}, 0, "rpm", false)
+	if err != nil {
+		return nil, err
+	}
 	info := nfpm.WithDefaults(&nfpm.Info{
 		Name:        "tailscale",
 		Arch:        arch,
@@ -294,17 +365,7 @@ func (t *rpmTarget) Build(b *dist.Build) ([]string, error) {
 		Homepage:    "https://www.tailscale.com",
 		License:     "MIT",
 		Overridables: nfpm.Overridables{
-			Files: map[string]string{
-				ts:  "/usr/bin/tailscale",
-				tsd: "/usr/sbin/tailscaled",
-				filepath.Join(tailscaledDir, "tailscaled.service"): "/lib/systemd/system/tailscaled.service",
-			},
-			ConfigFiles: map[string]string{
-				filepath.Join(tailscaledDir, "tailscaled.defaults"): "/etc/default/tailscaled",
-			},
-			// SELinux policy on e.g. CentOS 8 forbids writing to /var/cache.
-			// Creating an empty directory at install time resolves this issue.
-			EmptyFolders: []string{"/var/cache/tailscale"},
+			Contents: contents,
 			Scripts: nfpm.Scripts{
 				PostInstall: filepath.Join(repoDir, "release/rpm/rpm.postinst.sh"),
 				PreRemove:   filepath.Join(repoDir, "release/rpm/rpm.prerm.sh"),
@@ -315,6 +376,11 @@ func (t *rpmTarget) Build(b *dist.Build) ([]string, error) {
 			Conflicts: []string{"tailscale-relay"},
 			RPM: nfpm.RPM{
 				Group: "Network",
+				Signature: nfpm.RPMSignature{
+					PackageSignature: nfpm.PackageSignature{
+						SignFn: t.signFn,
+					},
+				},
 			},
 		},
 	})
@@ -354,6 +420,10 @@ func debArch(arch string) string {
 		// can ship more than 1 ARM deb, so for now match redo's behavior of
 		// shipping armv5 binaries in an armv7 trenchcoat.
 		return "armhf"
+	case "mipsle":
+		return "mipsel"
+	case "mips64le":
+		return "mips64el"
 	default:
 		return arch
 	}
@@ -372,6 +442,10 @@ func rpmArch(arch string) string {
 		return "armv7hl"
 	case "arm64":
 		return "aarch64"
+	case "mipsle":
+		return "mipsel"
+	case "mips64le":
+		return "mips64el"
 	default:
 		return arch
 	}

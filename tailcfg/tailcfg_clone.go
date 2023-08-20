@@ -6,12 +6,14 @@
 package tailcfg
 
 import (
+	"maps"
 	"net/netip"
 	"time"
 
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
+	"tailscale.com/types/ptr"
 	"tailscale.com/types/structs"
 	"tailscale.com/types/tkatype"
 )
@@ -34,7 +36,6 @@ var _UserCloneNeedsRegeneration = User(struct {
 	LoginName     string
 	DisplayName   string
 	ProfilePicURL string
-	Domain        string
 	Logins        []LoginID
 	Created       time.Time
 }{})
@@ -55,17 +56,14 @@ func (src *Node) Clone() *Node {
 	dst.Tags = append(src.Tags[:0:0], src.Tags...)
 	dst.PrimaryRoutes = append(src.PrimaryRoutes[:0:0], src.PrimaryRoutes...)
 	if dst.LastSeen != nil {
-		dst.LastSeen = new(time.Time)
-		*dst.LastSeen = *src.LastSeen
+		dst.LastSeen = ptr.To(*src.LastSeen)
 	}
 	if dst.Online != nil {
-		dst.Online = new(bool)
-		*dst.Online = *src.Online
+		dst.Online = ptr.To(*src.Online)
 	}
 	dst.Capabilities = append(src.Capabilities[:0:0], src.Capabilities...)
 	if dst.SelfNodeV4MasqAddrForThisPeer != nil {
-		dst.SelfNodeV4MasqAddrForThisPeer = new(netip.Addr)
-		*dst.SelfNodeV4MasqAddrForThisPeer = *src.SelfNodeV4MasqAddrForThisPeer
+		dst.SelfNodeV4MasqAddrForThisPeer = ptr.To(*src.SelfNodeV4MasqAddrForThisPeer)
 	}
 	return dst
 }
@@ -93,7 +91,6 @@ var _NodeCloneNeedsRegeneration = Node(struct {
 	PrimaryRoutes                 []netip.Prefix
 	LastSeen                      *time.Time
 	Online                        *bool
-	KeepAlive                     bool
 	MachineAuthorized             bool
 	Capabilities                  []string
 	UnsignedPeerAPIOnly           bool
@@ -119,6 +116,9 @@ func (src *Hostinfo) Clone() *Hostinfo {
 	dst.Services = append(src.Services[:0:0], src.Services...)
 	dst.NetInfo = src.NetInfo.Clone()
 	dst.SSH_HostKeys = append(src.SSH_HostKeys[:0:0], src.SSH_HostKeys...)
+	if dst.Location != nil {
+		dst.Location = ptr.To(*src.Location)
+	}
 	return dst
 }
 
@@ -157,6 +157,7 @@ var _HostinfoCloneNeedsRegeneration = Hostinfo(struct {
 	Cloud           string
 	Userspace       opt.Bool
 	UserspaceRouter opt.Bool
+	Location        *Location
 }{})
 
 // Clone makes a deep copy of NetInfo.
@@ -167,12 +168,7 @@ func (src *NetInfo) Clone() *NetInfo {
 	}
 	dst := new(NetInfo)
 	*dst = *src
-	if dst.DERPLatency != nil {
-		dst.DERPLatency = map[string]float64{}
-		for k, v := range src.DERPLatency {
-			dst.DERPLatency[k] = v
-		}
-	}
+	dst.DERPLatency = maps.Clone(src.DERPLatency)
 	return dst
 }
 
@@ -191,6 +187,7 @@ var _NetInfoCloneNeedsRegeneration = NetInfo(struct {
 	PreferredDERP         int
 	LinkType              string
 	DERPLatency           map[string]float64
+	FirewallMode          string
 }{})
 
 // Clone makes a deep copy of Login.
@@ -212,7 +209,6 @@ var _LoginCloneNeedsRegeneration = Login(struct {
 	LoginName     string
 	DisplayName   string
 	ProfilePicURL string
-	Domain        string
 }{})
 
 // Clone makes a deep copy of DNSConfig.
@@ -256,6 +252,7 @@ var _DNSConfigCloneNeedsRegeneration = DNSConfig(struct {
 	CertDomains         []string
 	ExtraRecords        []DNSRecord
 	ExitNodeFilteredSet []string
+	TempCorpIssue13969  string
 }{})
 
 // Clone makes a deep copy of RegisterResponse.
@@ -280,6 +277,84 @@ var _RegisterResponseCloneNeedsRegeneration = RegisterResponse(struct {
 	AuthURL           string
 	NodeKeySignature  tkatype.MarshaledSignature
 	Error             string
+}{})
+
+// Clone makes a deep copy of RegisterResponseAuth.
+// The result aliases no memory with the original.
+func (src *RegisterResponseAuth) Clone() *RegisterResponseAuth {
+	if src == nil {
+		return nil
+	}
+	dst := new(RegisterResponseAuth)
+	*dst = *src
+	if dst.Oauth2Token != nil {
+		dst.Oauth2Token = ptr.To(*src.Oauth2Token)
+	}
+	return dst
+}
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _RegisterResponseAuthCloneNeedsRegeneration = RegisterResponseAuth(struct {
+	_           structs.Incomparable
+	Provider    string
+	LoginName   string
+	Oauth2Token *Oauth2Token
+	AuthKey     string
+}{})
+
+// Clone makes a deep copy of RegisterRequest.
+// The result aliases no memory with the original.
+func (src *RegisterRequest) Clone() *RegisterRequest {
+	if src == nil {
+		return nil
+	}
+	dst := new(RegisterRequest)
+	*dst = *src
+	dst.Auth = *src.Auth.Clone()
+	dst.Hostinfo = src.Hostinfo.Clone()
+	dst.NodeKeySignature = append(src.NodeKeySignature[:0:0], src.NodeKeySignature...)
+	if dst.Timestamp != nil {
+		dst.Timestamp = ptr.To(*src.Timestamp)
+	}
+	dst.DeviceCert = append(src.DeviceCert[:0:0], src.DeviceCert...)
+	dst.Signature = append(src.Signature[:0:0], src.Signature...)
+	return dst
+}
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _RegisterRequestCloneNeedsRegeneration = RegisterRequest(struct {
+	_                structs.Incomparable
+	Version          CapabilityVersion
+	NodeKey          key.NodePublic
+	OldNodeKey       key.NodePublic
+	NLKey            key.NLPublic
+	Auth             RegisterResponseAuth
+	Expiry           time.Time
+	Followup         string
+	Hostinfo         *Hostinfo
+	Ephemeral        bool
+	NodeKeySignature tkatype.MarshaledSignature
+	SignatureType    SignatureType
+	Timestamp        *time.Time
+	DeviceCert       []byte
+	Signature        []byte
+}{})
+
+// Clone makes a deep copy of DERPHomeParams.
+// The result aliases no memory with the original.
+func (src *DERPHomeParams) Clone() *DERPHomeParams {
+	if src == nil {
+		return nil
+	}
+	dst := new(DERPHomeParams)
+	*dst = *src
+	dst.RegionScore = maps.Clone(src.RegionScore)
+	return dst
+}
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _DERPHomeParamsCloneNeedsRegeneration = DERPHomeParams(struct {
+	RegionScore map[int]float64
 }{})
 
 // Clone makes a deep copy of DERPRegion.
@@ -314,6 +389,7 @@ func (src *DERPMap) Clone() *DERPMap {
 	}
 	dst := new(DERPMap)
 	*dst = *src
+	dst.HomeParams = src.HomeParams.Clone()
 	if dst.Regions != nil {
 		dst.Regions = map[int]*DERPRegion{}
 		for k, v := range src.Regions {
@@ -325,6 +401,7 @@ func (src *DERPMap) Clone() *DERPMap {
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _DERPMapCloneNeedsRegeneration = DERPMap(struct {
+	HomeParams         *DERPHomeParams
 	Regions            map[int]*DERPRegion
 	OmitDefaultRegions bool
 }{})
@@ -353,6 +430,7 @@ var _DERPNodeCloneNeedsRegeneration = DERPNode(struct {
 	DERPPort         int
 	InsecureForTests bool
 	STUNTestIP       string
+	CanPort80        bool
 }{})
 
 // Clone makes a deep copy of SSHRule.
@@ -364,19 +442,13 @@ func (src *SSHRule) Clone() *SSHRule {
 	dst := new(SSHRule)
 	*dst = *src
 	if dst.RuleExpires != nil {
-		dst.RuleExpires = new(time.Time)
-		*dst.RuleExpires = *src.RuleExpires
+		dst.RuleExpires = ptr.To(*src.RuleExpires)
 	}
 	dst.Principals = make([]*SSHPrincipal, len(src.Principals))
 	for i := range dst.Principals {
 		dst.Principals[i] = src.Principals[i].Clone()
 	}
-	if dst.SSHUsers != nil {
-		dst.SSHUsers = map[string]string{}
-		for k, v := range src.SSHUsers {
-			dst.SSHUsers[k] = v
-		}
-	}
+	dst.SSHUsers = maps.Clone(src.SSHUsers)
 	dst.Action = src.Action.Clone()
 	return dst
 }
@@ -398,19 +470,24 @@ func (src *SSHAction) Clone() *SSHAction {
 	dst := new(SSHAction)
 	*dst = *src
 	dst.Recorders = append(src.Recorders[:0:0], src.Recorders...)
+	if dst.OnRecordingFailure != nil {
+		dst.OnRecordingFailure = ptr.To(*src.OnRecordingFailure)
+	}
 	return dst
 }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _SSHActionCloneNeedsRegeneration = SSHAction(struct {
-	Message                  string
-	Reject                   bool
-	Accept                   bool
-	SessionDuration          time.Duration
-	AllowAgentForwarding     bool
-	HoldAndDelegate          string
-	AllowLocalPortForwarding bool
-	Recorders                []netip.AddrPort
+	Message                   string
+	Reject                    bool
+	Accept                    bool
+	SessionDuration           time.Duration
+	AllowAgentForwarding      bool
+	HoldAndDelegate           string
+	AllowLocalPortForwarding  bool
+	AllowRemotePortForwarding bool
+	Recorders                 []netip.AddrPort
+	OnRecordingFailure        *SSHRecorderFailureAction
 }{})
 
 // Clone makes a deep copy of SSHPrincipal.
@@ -451,9 +528,51 @@ var _ControlDialPlanCloneNeedsRegeneration = ControlDialPlan(struct {
 	Candidates []ControlIPCandidate
 }{})
 
+// Clone makes a deep copy of Location.
+// The result aliases no memory with the original.
+func (src *Location) Clone() *Location {
+	if src == nil {
+		return nil
+	}
+	dst := new(Location)
+	*dst = *src
+	return dst
+}
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _LocationCloneNeedsRegeneration = Location(struct {
+	Country     string
+	CountryCode string
+	City        string
+	CityCode    string
+	Priority    int
+}{})
+
+// Clone makes a deep copy of UserProfile.
+// The result aliases no memory with the original.
+func (src *UserProfile) Clone() *UserProfile {
+	if src == nil {
+		return nil
+	}
+	dst := new(UserProfile)
+	*dst = *src
+	dst.Groups = append(src.Groups[:0:0], src.Groups...)
+	return dst
+}
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _UserProfileCloneNeedsRegeneration = UserProfile(struct {
+	ID            UserID
+	LoginName     string
+	DisplayName   string
+	ProfilePicURL string
+	Roles         emptyStructJSONSlice
+	Groups        []string
+}{})
+
 // Clone duplicates src into dst and reports whether it succeeded.
 // To succeed, <src, dst> must be of types <*T, *T> or <*T, **T>,
-// where T is one of User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan.
+// where T is one of User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,RegisterResponseAuth,RegisterRequest,DERPHomeParams,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan,Location,UserProfile.
 func Clone(dst, src any) bool {
 	switch src := src.(type) {
 	case *User:
@@ -519,6 +638,33 @@ func Clone(dst, src any) bool {
 			*dst = src.Clone()
 			return true
 		}
+	case *RegisterResponseAuth:
+		switch dst := dst.(type) {
+		case *RegisterResponseAuth:
+			*dst = *src.Clone()
+			return true
+		case **RegisterResponseAuth:
+			*dst = src.Clone()
+			return true
+		}
+	case *RegisterRequest:
+		switch dst := dst.(type) {
+		case *RegisterRequest:
+			*dst = *src.Clone()
+			return true
+		case **RegisterRequest:
+			*dst = src.Clone()
+			return true
+		}
+	case *DERPHomeParams:
+		switch dst := dst.(type) {
+		case *DERPHomeParams:
+			*dst = *src.Clone()
+			return true
+		case **DERPHomeParams:
+			*dst = src.Clone()
+			return true
+		}
 	case *DERPRegion:
 		switch dst := dst.(type) {
 		case *DERPRegion:
@@ -579,6 +725,24 @@ func Clone(dst, src any) bool {
 			*dst = *src.Clone()
 			return true
 		case **ControlDialPlan:
+			*dst = src.Clone()
+			return true
+		}
+	case *Location:
+		switch dst := dst.(type) {
+		case *Location:
+			*dst = *src.Clone()
+			return true
+		case **Location:
+			*dst = src.Clone()
+			return true
+		}
+	case *UserProfile:
+		switch dst := dst.(type) {
+		case *UserProfile:
+			*dst = *src.Clone()
+			return true
+		case **UserProfile:
 			*dst = src.Clone()
 			return true
 		}

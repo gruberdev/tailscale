@@ -15,7 +15,6 @@ import (
 	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
-	"tailscale.com/wgengine/monitor"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 )
@@ -53,9 +52,9 @@ var ErrNoChanges = errors.New("no changes made to Engine config")
 
 // PeerForIP is the type returned by Engine.PeerForIP.
 type PeerForIP struct {
-	// Node is the matched node. It's always non-nil when
+	// Node is the matched node. It's always a valid value when
 	// Engine.PeerForIP returns ok==true.
-	Node *tailcfg.Node
+	Node tailcfg.NodeView
 
 	// IsSelf is whether the Node is the local process.
 	IsSelf bool
@@ -73,10 +72,8 @@ type Engine interface {
 	// This is called whenever tailcontrol (the control plane)
 	// sends an updated network map.
 	//
-	// The *tailcfg.Debug parameter can be nil.
-	//
 	// The returned error is ErrNoChanges if no changes were made.
-	Reconfig(*wgcfg.Config, *router.Config, *dns.Config, *tailcfg.Debug) error
+	Reconfig(*wgcfg.Config, *router.Config, *dns.Config) error
 
 	// PeerForIP returns the node to which the provided IP routes,
 	// if any. If none is found, (nil, false) is returned.
@@ -91,9 +88,6 @@ type Engine interface {
 	// SetStatusCallback sets the function to call when the
 	// WireGuard status changes.
 	SetStatusCallback(StatusCallback)
-
-	// GetLinkMonitor returns the link monitor.
-	GetLinkMonitor() *monitor.Mon
 
 	// RequestStatus requests a WireGuard status update right
 	// away, sent to the callback registered via SetStatusCallback.
@@ -119,7 +113,7 @@ type Engine interface {
 	//
 	// Deprecated: don't use this method. It was removed shortly
 	// before the Tailscale 1.6 release when we remembered that
-	// Android doesn't use the Linux-based link monitor and has
+	// Android doesn't use the Linux-based network monitor and has
 	// its own mechanism that uses LinkChange. Android is the only
 	// caller of this method now. Don't add more.
 	LinkChange(isExpensive bool)
@@ -154,9 +148,11 @@ type Engine interface {
 	// status builder.
 	UpdateStatus(*ipnstate.StatusBuilder)
 
-	// Ping is a request to start a ping with the peer handling the given IP and
-	// then call cb with its ping latency & method.
-	Ping(ip netip.Addr, pingType tailcfg.PingType, cb func(*ipnstate.PingResult))
+	// Ping is a request to start a ping of the given message size to the peer
+	// handling the given IP, then call cb with its ping latency & method.
+	//
+	// If size is zero too small, it is ignored. See tailscale.PingOpts for details.
+	Ping(ip netip.Addr, pingType tailcfg.PingType, size int, cb func(*ipnstate.PingResult))
 
 	// RegisterIPPortIdentity registers a given node (identified by its
 	// Tailscale IP) as temporarily having the given IP:port for whois lookups.

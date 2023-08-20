@@ -14,12 +14,12 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"text/tabwriter"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"golang.org/x/exp/slices"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/envknob"
 	"tailscale.com/paths"
@@ -129,15 +129,11 @@ change in the future.
 			certCmd,
 			netlockCmd,
 			licensesCmd,
+			exitNodeCmd,
 		},
 		FlagSet:   rootfs,
 		Exec:      func(context.Context, []string) error { return flag.ErrHelp },
 		UsageFunc: usageFunc,
-	}
-	for _, c := range rootCmd.Subcommands {
-		if c.UsageFunc == nil {
-			c.UsageFunc = usageFunc
-		}
 	}
 	if envknob.UseWIPCode() {
 		rootCmd.Subcommands = append(rootCmd.Subcommands,
@@ -154,6 +150,12 @@ change in the future.
 	}
 	if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
 		rootCmd.Subcommands = append(rootCmd.Subcommands, configureHostCmd)
+	}
+
+	for _, c := range rootCmd.Subcommands {
+		if c.UsageFunc == nil {
+			c.UsageFunc = usageFunc
+		}
 	}
 
 	if err := rootCmd.Parse(args); err != nil {

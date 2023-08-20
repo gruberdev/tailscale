@@ -4,23 +4,24 @@
 package ipnlocal
 
 import (
+	"encoding/json"
 	"fmt"
-	"runtime"
+	"os/user"
 	"strconv"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
+	"tailscale.com/util/must"
 )
 
 func TestProfileCurrentUserSwitch(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("TODO(#7876): test regressed on windows while CI was broken")
-	}
 	store := new(mem.Store)
 
 	pm, err := newProfileManagerWithGOOS(store, logger.Discard, "linux")
@@ -35,7 +36,6 @@ func TestProfileCurrentUserSwitch(t *testing.T) {
 		p := pm.CurrentPrefs().AsStruct()
 		p.Persist = &persist.Persist{
 			NodeID:         tailcfg.StableNodeID(fmt.Sprint(id)),
-			LoginName:      loginName,
 			PrivateNodeKey: key.NewNode(),
 			UserProfile: tailcfg.UserProfile{
 				ID:        tailcfg.UserID(id),
@@ -77,9 +77,6 @@ func TestProfileCurrentUserSwitch(t *testing.T) {
 }
 
 func TestProfileList(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("TODO(#7876): test regressed on windows while CI was broken")
-	}
 	store := new(mem.Store)
 
 	pm, err := newProfileManagerWithGOOS(store, logger.Discard, "linux")
@@ -94,7 +91,6 @@ func TestProfileList(t *testing.T) {
 		p := pm.CurrentPrefs().AsStruct()
 		p.Persist = &persist.Persist{
 			NodeID:         tailcfg.StableNodeID(fmt.Sprint(id)),
-			LoginName:      loginName,
 			PrivateNodeKey: key.NewNode(),
 			UserProfile: tailcfg.UserProfile{
 				ID:        tailcfg.UserID(id),
@@ -138,29 +134,190 @@ func TestProfileList(t *testing.T) {
 	if lp := pm.findProfileByName(carol.Name); lp != nil {
 		t.Fatalf("found profile for user2 in user1's profile list")
 	}
-	if lp := pm.findProfilesByNodeID(carol.ControlURL, carol.NodeID); lp != nil {
-		t.Fatalf("found profile for user2 in user1's profile list")
-	}
-	if lp := pm.findProfilesByUserID(carol.ControlURL, carol.UserProfile.ID); lp != nil {
-		t.Fatalf("found profile for user2 in user1's profile list")
-	}
 
 	pm.SetCurrentUserID("user2")
 	checkProfiles(t, "carol")
-	if lp := pm.findProfilesByNodeID(carol.ControlURL, carol.NodeID); lp == nil {
-		t.Fatalf("did not find profile for user2 in user2's profile list")
+}
+
+func TestProfileDupe(t *testing.T) {
+	newPersist := func(user, node int) *persist.Persist {
+		return &persist.Persist{
+			NodeID: tailcfg.StableNodeID(fmt.Sprintf("node%d", node)),
+			UserProfile: tailcfg.UserProfile{
+				ID:        tailcfg.UserID(user),
+				LoginName: fmt.Sprintf("user%d@example.com", user),
+			},
+		}
 	}
-	if lp := pm.findProfilesByUserID(carol.ControlURL, carol.UserProfile.ID); lp == nil {
-		t.Fatalf("did not find profile for user2 in user2's profile list")
+	user1Node1 := newPersist(1, 1)
+	user1Node2 := newPersist(1, 2)
+	user2Node1 := newPersist(2, 1)
+	user2Node2 := newPersist(2, 2)
+	user3Node3 := newPersist(3, 3)
+
+	reauth := func(pm *profileManager, p *persist.Persist) {
+		prefs := ipn.NewPrefs()
+		prefs.Persist = p
+		must.Do(pm.SetPrefs(prefs.View()))
+	}
+	login := func(pm *profileManager, p *persist.Persist) {
+		pm.NewProfile()
+		reauth(pm, p)
 	}
 
+	type step struct {
+		fn func(pm *profileManager, p *persist.Persist)
+		p  *persist.Persist
+	}
+
+	tests := []struct {
+		name  string
+		steps []step
+		profs []*persist.Persist
+	}{
+		{
+			name: "reauth-new-node",
+			steps: []step{
+				{login, user1Node1},
+				{reauth, user3Node3},
+			},
+			profs: []*persist.Persist{
+				user3Node3,
+			},
+		},
+		{
+			name: "reauth-same-node",
+			steps: []step{
+				{login, user1Node1},
+				{reauth, user1Node1},
+			},
+			profs: []*persist.Persist{
+				user1Node1,
+			},
+		},
+		{
+			name: "reauth-other-profile",
+			steps: []step{
+				{login, user1Node1},
+				{login, user2Node2},
+				{reauth, user1Node1},
+			},
+			profs: []*persist.Persist{
+				user1Node1,
+				user2Node2,
+			},
+		},
+		{
+			name: "reauth-replace-user",
+			steps: []step{
+				{login, user1Node1},
+				{login, user3Node3},
+				{reauth, user2Node1},
+			},
+			profs: []*persist.Persist{
+				user2Node1,
+				user3Node3,
+			},
+		},
+		{
+			name: "reauth-replace-node",
+			steps: []step{
+				{login, user1Node1},
+				{login, user3Node3},
+				{reauth, user1Node2},
+			},
+			profs: []*persist.Persist{
+				user1Node2,
+				user3Node3,
+			},
+		},
+		{
+			name: "login-same-node",
+			steps: []step{
+				{login, user1Node1},
+				{login, user3Node3}, // random other profile
+				{login, user1Node1},
+			},
+			profs: []*persist.Persist{
+				user1Node1,
+				user3Node3,
+			},
+		},
+		{
+			name: "login-replace-user",
+			steps: []step{
+				{login, user1Node1},
+				{login, user3Node3}, // random other profile
+				{login, user2Node1},
+			},
+			profs: []*persist.Persist{
+				user2Node1,
+				user3Node3,
+			},
+		},
+		{
+			name: "login-replace-node",
+			steps: []step{
+				{login, user1Node1},
+				{login, user3Node3}, // random other profile
+				{login, user1Node2},
+			},
+			profs: []*persist.Persist{
+				user1Node2,
+				user3Node3,
+			},
+		},
+		{
+			name: "login-new-node",
+			steps: []step{
+				{login, user1Node1},
+				{login, user2Node2},
+			},
+			profs: []*persist.Persist{
+				user1Node1,
+				user2Node2,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := new(mem.Store)
+			pm, err := newProfileManagerWithGOOS(store, logger.Discard, "linux")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, s := range tc.steps {
+				s.fn(pm, s.p)
+			}
+			profs := pm.Profiles()
+			var got []*persist.Persist
+			for _, p := range profs {
+				prefs, err := pm.loadSavedPrefs(p.Key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got = append(got, prefs.Persist().AsStruct())
+			}
+			d := cmp.Diff(tc.profs, got, cmpopts.SortSlices(func(a, b *persist.Persist) bool {
+				if a.NodeID != b.NodeID {
+					return a.NodeID < b.NodeID
+				}
+				return a.UserProfile.ID < b.UserProfile.ID
+			}))
+			if d != "" {
+				t.Fatal(d)
+			}
+		})
+	}
+}
+
+func asJSON(v any) []byte {
+	return must.Get(json.MarshalIndent(v, "", "  "))
 }
 
 // TestProfileManagement tests creating, loading, and switching profiles.
 func TestProfileManagement(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("TODO(#7876): test regressed on windows while CI was broken")
-	}
 	store := new(mem.Store)
 
 	pm, err := newProfileManagerWithGOOS(store, logger.Discard, "linux")
@@ -220,7 +377,6 @@ func TestProfileManagement(t *testing.T) {
 			nodeIDs[loginName] = nid
 		}
 		p.Persist = &persist.Persist{
-			LoginName:      loginName,
 			PrivateNodeKey: key.NewNode(),
 			UserProfile: tailcfg.UserProfile{
 				ID:        uid,
@@ -312,10 +468,11 @@ func TestProfileManagement(t *testing.T) {
 // TestProfileManagementWindows tests going into and out of Unattended mode on
 // Windows.
 func TestProfileManagementWindows(t *testing.T) {
-
-	if runtime.GOOS == "windows" {
-		t.Skip("TODO(#7876): test regressed on windows while CI was broken")
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
 	}
+	uid := ipn.WindowsUserID(u.Uid)
 
 	store := new(mem.Store)
 
@@ -348,7 +505,6 @@ func TestProfileManagementWindows(t *testing.T) {
 		p := pm.CurrentPrefs().AsStruct()
 		p.ForceDaemon = forceDaemon
 		p.Persist = &persist.Persist{
-			LoginName: loginName,
 			UserProfile: tailcfg.UserProfile{
 				ID:        id,
 				LoginName: loginName,
@@ -365,8 +521,8 @@ func TestProfileManagementWindows(t *testing.T) {
 
 	{
 		t.Logf("Set user1 as logged in user")
-		if err := pm.SetCurrentUserID("user1"); err != nil {
-			t.Fatal(err)
+		if err := pm.SetCurrentUserID(uid); err != nil {
+			t.Fatalf("can't set user id: %s", err)
 		}
 		checkProfiles(t)
 		t.Logf("Save prefs for user1")
@@ -401,7 +557,7 @@ func TestProfileManagementWindows(t *testing.T) {
 
 	{
 		t.Logf("Set user1 as current user")
-		if err := pm.SetCurrentUserID("user1"); err != nil {
+		if err := pm.SetCurrentUserID(uid); err != nil {
 			t.Fatal(err)
 		}
 		wantCurProfile = "test"
@@ -411,8 +567,8 @@ func TestProfileManagementWindows(t *testing.T) {
 		t.Logf("set unattended mode")
 		wantProfiles["test"] = setPrefs(t, "test", true)
 	}
-	if pm.CurrentUserID() != "user1" {
-		t.Fatalf("CurrentUserID = %q; want %q", pm.CurrentUserID(), "user1")
+	if pm.CurrentUserID() != uid {
+		t.Fatalf("CurrentUserID = %q; want %q", pm.CurrentUserID(), uid)
 	}
 
 	// Recreate the profile manager to ensure that it starts with test profile.
@@ -421,7 +577,7 @@ func TestProfileManagementWindows(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkProfiles(t)
-	if pm.CurrentUserID() != "user1" {
-		t.Fatalf("CurrentUserID = %q; want %q", pm.CurrentUserID(), "user1")
+	if pm.CurrentUserID() != uid {
+		t.Fatalf("CurrentUserID = %q; want %q", pm.CurrentUserID(), uid)
 	}
 }

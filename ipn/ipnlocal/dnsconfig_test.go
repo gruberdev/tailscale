@@ -16,6 +16,7 @@ import (
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/cloudenv"
+	"tailscale.com/util/cmpx"
 	"tailscale.com/util/dnsname"
 )
 
@@ -35,6 +36,14 @@ func ips(ss ...string) (ips []netip.Addr) {
 		ips = append(ips, netip.MustParseAddr(s))
 	}
 	return
+}
+
+func nodeViews(v []*tailcfg.Node) []tailcfg.NodeView {
+	nv := make([]tailcfg.NodeView, len(v))
+	for i, n := range v {
+		nv[i] = n.View()
+	}
+	return nv
 }
 
 func TestDNSConfigForNetmap(t *testing.T) {
@@ -61,7 +70,7 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			nm: &netmap.NetworkMap{
 				Name:      "myname.net",
 				Addresses: ipps("100.101.101.101"),
-				Peers: []*tailcfg.Node{
+				Peers: nodeViews([]*tailcfg.Node{
 					{
 						Name:      "peera.net",
 						Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::1001", "fe75::1002"),
@@ -74,7 +83,7 @@ func TestDNSConfigForNetmap(t *testing.T) {
 						Name:      "v6-only.net",
 						Addresses: ipps("fe75::3"), // no IPv4, so we don't ignore IPv6
 					},
-				},
+				}),
 			},
 			prefs: &ipn.Prefs{},
 			want: &dns.Config{
@@ -95,7 +104,7 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			nm: &netmap.NetworkMap{
 				Name:      "myname.net",
 				Addresses: ipps("fe75::1"),
-				Peers: []*tailcfg.Node{
+				Peers: nodeViews([]*tailcfg.Node{
 					{
 						Name:      "peera.net",
 						Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::1001"),
@@ -108,7 +117,7 @@ func TestDNSConfigForNetmap(t *testing.T) {
 						Name:      "v6-only.net",
 						Addresses: ipps("fe75::3"), // no IPv4, so we don't ignore IPv6
 					},
-				},
+				}),
 			},
 			prefs: &ipn.Prefs{},
 			want: &dns.Config{
@@ -308,10 +317,7 @@ func TestDNSConfigForNetmap(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			verOS := tt.os
-			if verOS == "" {
-				verOS = "linux"
-			}
+			verOS := cmpx.Or(tt.os, "linux")
 			var log tstest.MemLogger
 			got := dnsConfigForNetmap(tt.nm, tt.prefs.View(), log.Logf, verOS)
 			if !reflect.DeepEqual(got, tt.want) {

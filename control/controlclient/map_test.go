@@ -14,18 +14,15 @@ import (
 	"go4.org/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
 )
 
 func TestUndeltaPeers(t *testing.T) {
 	var curTime time.Time
-	tstest.Replace(t, &clockNow, func() time.Time {
-		return curTime
-	})
 
 	online := func(v bool) func(*tailcfg.Node) {
 		return func(n *tailcfg.Node) {
@@ -298,6 +295,7 @@ func TestUndeltaPeers(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if !tt.curTime.IsZero() {
 				curTime = tt.curTime
+				tstest.Replace(t, &clock, tstime.Clock(tstest.NewClock(tstest.ClockOpts{Start: curTime})))
 			}
 			undeltaPeers(tt.mapRes, tt.prev)
 			if !reflect.DeepEqual(tt.mapRes.Peers, tt.want) {
@@ -471,17 +469,27 @@ func TestNetmapForResponse(t *testing.T) {
 	})
 }
 
-// TestDeltaDebug tests that tailcfg.Debug values can be omitted in MapResponses
-// entirely or have their opt.Bool values unspecified between MapResponses in a
-// session and that should mean no change. (as of capver 37). But two Debug
-// fields existed prior to capver 37 that weren't opt.Bool; we test that we both
-// still accept the non-opt.Bool form from control for RandomizeClientPort and
-// ForceBackgroundSTUN and also accept the new form, keeping the old form in
-// sync.
-func TestDeltaDebug(t *testing.T) {
+func TestDeltaDERPMap(t *testing.T) {
+	regions1 := map[int]*tailcfg.DERPRegion{
+		1: {
+			RegionID: 1,
+			Nodes: []*tailcfg.DERPNode{{
+				Name:     "derp1a",
+				RegionID: 1,
+				HostName: "derp1a" + tailcfg.DotInvalid,
+				IPv4:     "169.254.169.254",
+				IPv6:     "none",
+			}},
+		},
+	}
+
+	// As above, but with a changed IPv4 addr
+	regions2 := map[int]*tailcfg.DERPRegion{1: regions1[1].Clone()}
+	regions2[1].Nodes[0].IPv4 = "127.0.0.1"
+
 	type step struct {
-		got  *tailcfg.Debug
-		want *tailcfg.Debug
+		got  *tailcfg.DERPMap
+		want *tailcfg.DERPMap
 	}
 	tests := []struct {
 		name  string
@@ -495,94 +503,60 @@ func TestDeltaDebug(t *testing.T) {
 			},
 		},
 		{
-			name: "sticky-with-old-style-randomize-client-port",
+			name: "regions-sticky",
 			steps: []step{
+				{&tailcfg.DERPMap{Regions: regions1}, &tailcfg.DERPMap{Regions: regions1}},
+				{&tailcfg.DERPMap{}, &tailcfg.DERPMap{Regions: regions1}},
+			},
+		},
+		{
+			name: "regions-change",
+			steps: []step{
+				{&tailcfg.DERPMap{Regions: regions1}, &tailcfg.DERPMap{Regions: regions1}},
+				{&tailcfg.DERPMap{Regions: regions2}, &tailcfg.DERPMap{Regions: regions2}},
+			},
+		},
+		{
+			name: "home-params",
+			steps: []step{
+				// Send a DERP map
+				{&tailcfg.DERPMap{Regions: regions1}, &tailcfg.DERPMap{Regions: regions1}},
+				// Send home params, want to still have the same regions
 				{
-					&tailcfg.Debug{RandomizeClientPort: true},
-					&tailcfg.Debug{
-						RandomizeClientPort:    true,
-						SetRandomizeClientPort: "true",
-					},
-				},
-				{
-					nil, // not sent by server
-					&tailcfg.Debug{
-						RandomizeClientPort:    true,
-						SetRandomizeClientPort: "true",
-					},
+					&tailcfg.DERPMap{HomeParams: &tailcfg.DERPHomeParams{
+						RegionScore: map[int]float64{1: 0.5},
+					}},
+					&tailcfg.DERPMap{Regions: regions1, HomeParams: &tailcfg.DERPHomeParams{
+						RegionScore: map[int]float64{1: 0.5},
+					}},
 				},
 			},
 		},
 		{
-			name: "sticky-with-new-style-randomize-client-port",
+			name: "home-params-sub-fields",
 			steps: []step{
+				// Send a DERP map with home params
 				{
-					&tailcfg.Debug{SetRandomizeClientPort: "true"},
-					&tailcfg.Debug{
-						RandomizeClientPort:    true,
-						SetRandomizeClientPort: "true",
-					},
+					&tailcfg.DERPMap{Regions: regions1, HomeParams: &tailcfg.DERPHomeParams{
+						RegionScore: map[int]float64{1: 0.5},
+					}},
+					&tailcfg.DERPMap{Regions: regions1, HomeParams: &tailcfg.DERPHomeParams{
+						RegionScore: map[int]float64{1: 0.5},
+					}},
 				},
+				// Sending a struct with a 'HomeParams' field but nil RegionScore doesn't change home params...
 				{
-					nil, // not sent by server
-					&tailcfg.Debug{
-						RandomizeClientPort:    true,
-						SetRandomizeClientPort: "true",
-					},
+					&tailcfg.DERPMap{HomeParams: &tailcfg.DERPHomeParams{RegionScore: nil}},
+					&tailcfg.DERPMap{Regions: regions1, HomeParams: &tailcfg.DERPHomeParams{
+						RegionScore: map[int]float64{1: 0.5},
+					}},
 				},
-			},
-		},
-		{
-			name: "opt-bool-sticky-changing-over-time",
-			steps: []step{
-				{nil, nil},
-				{nil, nil},
+				// ... but sending one with a non-nil and empty RegionScore field zeroes that out.
 				{
-					&tailcfg.Debug{OneCGNATRoute: "true"},
-					&tailcfg.Debug{OneCGNATRoute: "true"},
-				},
-				{
-					nil,
-					&tailcfg.Debug{OneCGNATRoute: "true"},
-				},
-				{
-					&tailcfg.Debug{OneCGNATRoute: "false"},
-					&tailcfg.Debug{OneCGNATRoute: "false"},
-				},
-				{
-					nil,
-					&tailcfg.Debug{OneCGNATRoute: "false"},
-				},
-			},
-		},
-		{
-			name: "legacy-ForceBackgroundSTUN",
-			steps: []step{
-				{
-					&tailcfg.Debug{ForceBackgroundSTUN: true},
-					&tailcfg.Debug{ForceBackgroundSTUN: true, SetForceBackgroundSTUN: "true"},
-				},
-			},
-		},
-		{
-			name: "opt-bool-SetForceBackgroundSTUN",
-			steps: []step{
-				{
-					&tailcfg.Debug{SetForceBackgroundSTUN: "true"},
-					&tailcfg.Debug{ForceBackgroundSTUN: true, SetForceBackgroundSTUN: "true"},
-				},
-			},
-		},
-		{
-			name: "server-reset-to-default",
-			steps: []step{
-				{
-					&tailcfg.Debug{SetForceBackgroundSTUN: "true"},
-					&tailcfg.Debug{ForceBackgroundSTUN: true, SetForceBackgroundSTUN: "true"},
-				},
-				{
-					&tailcfg.Debug{SetForceBackgroundSTUN: "unset"},
-					&tailcfg.Debug{ForceBackgroundSTUN: false, SetForceBackgroundSTUN: "unset"},
+					&tailcfg.DERPMap{HomeParams: &tailcfg.DERPHomeParams{RegionScore: map[int]float64{}}},
+					&tailcfg.DERPMap{Regions: regions1, HomeParams: &tailcfg.DERPHomeParams{
+						RegionScore: map[int]float64{},
+					}},
 				},
 			},
 		},
@@ -591,31 +565,11 @@ func TestDeltaDebug(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ms := newTestMapSession(t)
 			for stepi, s := range tt.steps {
-				nm := ms.netmapForResponse(&tailcfg.MapResponse{Debug: s.got})
-				if !reflect.DeepEqual(nm.Debug, s.want) {
-					t.Errorf("unexpected result at step index %v; got: %s", stepi, must.Get(json.Marshal(nm.Debug)))
+				nm := ms.netmapForResponse(&tailcfg.MapResponse{DERPMap: s.got})
+				if !reflect.DeepEqual(nm.DERPMap, s.want) {
+					t.Errorf("unexpected result at step index %v; got: %s", stepi, must.Get(json.Marshal(nm.DERPMap)))
 				}
 			}
 		})
-	}
-}
-
-// Verifies that copyDebugOptBools doesn't missing any opt.Bools.
-func TestCopyDebugOptBools(t *testing.T) {
-	rt := reflect.TypeOf(tailcfg.Debug{})
-	for i := 0; i < rt.NumField(); i++ {
-		sf := rt.Field(i)
-		if sf.Type != reflect.TypeOf(opt.Bool("")) {
-			continue
-		}
-		var src, dst tailcfg.Debug
-		reflect.ValueOf(&src).Elem().Field(i).Set(reflect.ValueOf(opt.Bool("true")))
-		if src == (tailcfg.Debug{}) {
-			t.Fatalf("failed to set field %v", sf.Name)
-		}
-		copyDebugOptBools(&dst, &src)
-		if src != dst {
-			t.Fatalf("copyDebugOptBools didn't copy field %v", sf.Name)
-		}
 	}
 }

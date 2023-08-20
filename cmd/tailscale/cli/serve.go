@@ -10,19 +10,24 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/util/mak"
 	"tailscale.com/version"
 )
@@ -34,12 +39,14 @@ func newServeCommand(e *serveEnv) *ffcli.Command {
 	return &ffcli.Command{
 		Name:      "serve",
 		ShortHelp: "Serve content and local servers",
-		ShortUsage: strings.TrimSpace(`
-serve https:<port> <mount-point> <source> [off]
-  serve tcp:<port> tcp://localhost:<local-port> [off]
-  serve tls-terminated-tcp:<port> tcp://localhost:<local-port> [off]
-  serve status [--json]
-`),
+		ShortUsage: strings.Join([]string{
+			"serve http:<port> <mount-point> <source> [off]",
+			"serve https:<port> <mount-point> <source> [off]",
+			"serve tcp:<port> tcp://localhost:<local-port> [off]",
+			"serve tls-terminated-tcp:<port> tcp://localhost:<local-port> [off]",
+			"serve status [--json]",
+			"serve reset",
+		}, "\n  "),
 		LongHelp: strings.TrimSpace(`
 *** BETA; all of this is subject to change ***
 
@@ -56,8 +63,8 @@ EXAMPLES
   - To proxy requests to a web server at 127.0.0.1:3000:
     $ tailscale serve https:443 / http://127.0.0.1:3000
 
-	Or, using the default port:
-	$ tailscale serve https / http://127.0.0.1:3000
+    Or, using the default port (443):
+    $ tailscale serve https / http://127.0.0.1:3000
 
   - To serve a single file or a directory of files:
     $ tailscale serve https / /home/alice/blog/index.html
@@ -65,6 +72,12 @@ EXAMPLES
 
   - To serve simple static text:
     $ tailscale serve https:8080 / text:"Hello, world!"
+
+  - To serve over HTTP (tailnet only):
+    $ tailscale serve http:80 / http://127.0.0.1:3000
+
+    Or, using the default port (80):
+    $ tailscale serve http / http://127.0.0.1:3000
 
   - To forward incoming TCP connections on port 2222 to a local TCP server on
     port 22 (e.g. to run OpenSSH in parallel with Tailscale SSH):
@@ -84,6 +97,13 @@ EXAMPLES
 				FlagSet: e.newFlags("serve-status", func(fs *flag.FlagSet) {
 					fs.BoolVar(&e.json, "json", false, "output JSON")
 				}),
+				UsageFunc: usageFunc,
+			},
+			{
+				Name:      "reset",
+				Exec:      e.runServeReset,
+				ShortHelp: "reset current serve/funnel config",
+				FlagSet:   e.newFlags("serve-reset", nil),
 				UsageFunc: usageFunc,
 			},
 		},
@@ -109,9 +129,12 @@ func (e *serveEnv) newFlags(name string, setup func(fs *flag.FlagSet)) *flag.Fla
 //
 // The purpose of this interface is to allow tests to provide a mock.
 type localServeClient interface {
-	Status(context.Context) (*ipnstate.Status, error)
+	StatusWithoutPeers(context.Context) (*ipnstate.Status, error)
 	GetServeConfig(context.Context) (*ipn.ServeConfig, error)
 	SetServeConfig(context.Context, *ipn.ServeConfig) error
+	QueryFeature(ctx context.Context, feature string) (*tailcfg.QueryFeatureResponse, error)
+	WatchIPNBus(ctx context.Context, mask ipn.NotifyWatchOpt) (*tailscale.IPNBusWatcher, error)
+	IncrementCounter(ctx context.Context, name string, delta int) error
 }
 
 // serveEnv is the environment the serve command runs within. All I/O should be
@@ -135,19 +158,21 @@ type serveEnv struct {
 // The trailing dot is removed.
 // Returns an error if local client status fails.
 func (e *serveEnv) getSelfDNSName(ctx context.Context) (string, error) {
-	st, err := e.getLocalClientStatus(ctx)
+	st, err := e.getLocalClientStatusWithoutPeers(ctx)
 	if err != nil {
 		return "", fmt.Errorf("getting client status: %w", err)
 	}
 	return strings.TrimSuffix(st.Self.DNSName, "."), nil
 }
 
-// getLocalClientStatus returns the Status of the local client.
+// getLocalClientStatusWithoutPeers returns the Status of the local client
+// without any peers in the response.
+//
 // Returns error if unable to reach tailscaled or if self node is nil.
 //
 // Exits if status is not running or starting.
-func (e *serveEnv) getLocalClientStatus(ctx context.Context) (*ipnstate.Status, error) {
-	st, err := e.lc.Status(ctx)
+func (e *serveEnv) getLocalClientStatusWithoutPeers(ctx context.Context) (*ipnstate.Status, error) {
+	st, err := e.lc.StatusWithoutPeers(ctx)
 	if err != nil {
 		return nil, fixTailscaledConnectError(err)
 	}
@@ -166,6 +191,7 @@ func (e *serveEnv) getLocalClientStatus(ctx context.Context) (*ipnstate.Status, 
 // serve config types like proxy, path, and text.
 //
 // Examples:
+// - tailscale serve http / http://localhost:3000
 // - tailscale serve https / http://localhost:3000
 // - tailscale serve https /images/ /var/www/images/
 // - tailscale serve https:10000 /motd.txt text:"Hello, world!"
@@ -190,19 +216,14 @@ func (e *serveEnv) runServe(ctx context.Context, args []string) error {
 		return e.lc.SetServeConfig(ctx, sc)
 	}
 
-	parsePort := func(portStr string) (uint16, error) {
-		port64, err := strconv.ParseUint(portStr, 10, 16)
-		if err != nil {
-			return 0, err
-		}
-		return uint16(port64), nil
-	}
-
 	srcType, srcPortStr, found := strings.Cut(args[0], ":")
 	if !found {
 		if srcType == "https" && srcPortStr == "" {
 			// Default https port to 443.
 			srcPortStr = "443"
+		} else if srcType == "http" && srcPortStr == "" {
+			// Default http port to 80.
+			srcPortStr = "80"
 		} else {
 			return flag.ErrHelp
 		}
@@ -210,18 +231,33 @@ func (e *serveEnv) runServe(ctx context.Context, args []string) error {
 
 	turnOff := "off" == args[len(args)-1]
 
-	if len(args) < 2 || (srcType == "https" && !turnOff && len(args) < 3) {
+	if len(args) < 2 || ((srcType == "https" || srcType == "http") && !turnOff && len(args) < 3) {
 		fmt.Fprintf(os.Stderr, "error: invalid number of arguments\n\n")
 		return flag.ErrHelp
 	}
 
-	srcPort, err := parsePort(srcPortStr)
+	if srcType == "https" && !turnOff {
+		// Running serve with https requires that the tailnet has enabled
+		// https cert provisioning. Send users through an interactive flow
+		// to enable this if not already done.
+		//
+		// TODO(sonia,tailscale/corp#10577): The interactive feature flow
+		// is behind a control flag. If the tailnet doesn't have the flag
+		// on, enableFeatureInteractive will error. For now, we hide that
+		// error and maintain the previous behavior (prior to 2023-08-15)
+		// of letting them edit the serve config before enabling certs.
+		e.enableFeatureInteractive(ctx, "serve", func(caps []string) bool {
+			return slices.Contains(caps, tailcfg.CapabilityHTTPS)
+		})
+	}
+
+	srcPort, err := parseServePort(srcPortStr)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid port %q: %w", srcPortStr, err)
 	}
 
 	switch srcType {
-	case "https":
+	case "https", "http":
 		mount, err := cleanMountPoint(args[1])
 		if err != nil {
 			return err
@@ -229,7 +265,8 @@ func (e *serveEnv) runServe(ctx context.Context, args []string) error {
 		if turnOff {
 			return e.handleWebServeRemove(ctx, srcPort, mount)
 		}
-		return e.handleWebServe(ctx, srcPort, mount, args[2])
+		useTLS := srcType == "https"
+		return e.handleWebServe(ctx, srcPort, useTLS, mount, args[2])
 	case "tcp", "tls-terminated-tcp":
 		if turnOff {
 			return e.handleTCPServeRemove(ctx, srcPort)
@@ -237,20 +274,20 @@ func (e *serveEnv) runServe(ctx context.Context, args []string) error {
 		return e.handleTCPServe(ctx, srcType, srcPort, args[1])
 	default:
 		fmt.Fprintf(os.Stderr, "error: invalid serve type %q\n", srcType)
-		fmt.Fprint(os.Stderr, "must be one of: https:<port>, tcp:<port> or tls-terminated-tcp:<port>\n\n", srcType)
+		fmt.Fprint(os.Stderr, "must be one of: http:<port>, https:<port>, tcp:<port> or tls-terminated-tcp:<port>\n\n", srcType)
 		return flag.ErrHelp
 	}
 }
 
-// handleWebServe handles the "tailscale serve https:..." subcommand.
-// It configures the serve config to forward HTTPS connections to the
-// given source.
+// handleWebServe handles the "tailscale serve (http/https):..." subcommand. It
+// configures the serve config to forward HTTPS connections to the given source.
 //
 // Examples:
+//   - tailscale serve http / http://localhost:3000
 //   - tailscale serve https / http://localhost:3000
 //   - tailscale serve https:8443 /files/ /home/alice/shared-files/
 //   - tailscale serve https:10000 /motd.txt text:"Hello, world!"
-func (e *serveEnv) handleWebServe(ctx context.Context, srvPort uint16, mount, source string) error {
+func (e *serveEnv) handleWebServe(ctx context.Context, srvPort uint16, useTLS bool, mount, source string) error {
 	h := new(ipn.HTTPHandler)
 
 	ts, _, _ := strings.Cut(source, ":")
@@ -309,7 +346,7 @@ func (e *serveEnv) handleWebServe(ctx context.Context, srvPort uint16, mount, so
 		return flag.ErrHelp
 	}
 
-	mak.Set(&sc.TCP, srvPort, &ipn.TCPPortHandler{HTTPS: true})
+	mak.Set(&sc.TCP, srvPort, &ipn.TCPPortHandler{HTTPS: useTLS, HTTP: !useTLS})
 
 	if _, ok := sc.Web[hp]; !ok {
 		mak.Set(&sc.Web, hp, new(ipn.WebServerConfig))
@@ -412,6 +449,7 @@ func cleanMountPoint(mount string) (string, error) {
 	if mount == "" {
 		return "", errors.New("mount point cannot be empty")
 	}
+	mount = cleanMinGWPathConversionIfNeeded(mount)
 	if !strings.HasPrefix(mount, "/") {
 		mount = "/" + mount
 	}
@@ -420,6 +458,26 @@ func cleanMountPoint(mount string) (string, error) {
 		return mount, nil
 	}
 	return "", fmt.Errorf("invalid mount point %q", mount)
+}
+
+// cleanMinGWPathConversionIfNeeded strips the EXEPATH prefix from the given
+// path if the path is a MinGW(ish) (Windows) shell arg.
+//
+// MinGW(ish) (Windows) shells perform POSIX-to-Windows path conversion
+// converting the leading "/" of any shell arg to the EXEPATH, which mangles the
+// mount point. Strip the EXEPATH prefix if it exists. #7963
+//
+// "/C:/Program Files/Git/foo" -> "/foo"
+func cleanMinGWPathConversionIfNeeded(path string) string {
+	// Only do this on Windows.
+	if runtime.GOOS != "windows" {
+		return path
+	}
+	if _, ok := os.LookupEnv("MSYSTEM"); ok {
+		exepath := filepath.ToSlash(os.Getenv("EXEPATH"))
+		path = strings.TrimPrefix(path, exepath)
+	}
+	return path
 }
 
 func expandProxyTarget(source string) (string, error) {
@@ -585,7 +643,7 @@ func (e *serveEnv) runServeStatus(ctx context.Context, args []string) error {
 		printf("No serve config\n")
 		return nil
 	}
-	st, err := e.getLocalClientStatus(ctx)
+	st, err := e.getLocalClientStatusWithoutPeers(ctx)
 	if err != nil {
 		return err
 	}
@@ -596,7 +654,10 @@ func (e *serveEnv) runServeStatus(ctx context.Context, args []string) error {
 		printf("\n")
 	}
 	for hp := range sc.Web {
-		printWebStatusTree(sc, hp)
+		err := e.printWebStatusTree(sc, hp)
+		if err != nil {
+			return err
+		}
 		printf("\n")
 	}
 	printFunnelWarning(sc)
@@ -635,20 +696,37 @@ func printTCPStatusTree(ctx context.Context, sc *ipn.ServeConfig, st *ipnstate.S
 	return nil
 }
 
-func printWebStatusTree(sc *ipn.ServeConfig, hp ipn.HostPort) {
+func (e *serveEnv) printWebStatusTree(sc *ipn.ServeConfig, hp ipn.HostPort) error {
+	// No-op if no serve config
 	if sc == nil {
-		return
+		return nil
 	}
 	fStatus := "tailnet only"
 	if sc.AllowFunnel[hp] {
 		fStatus = "Funnel on"
 	}
 	host, portStr, _ := net.SplitHostPort(string(hp))
-	if portStr == "443" {
-		printf("https://%s (%s)\n", host, fStatus)
-	} else {
-		printf("https://%s:%s (%s)\n", host, portStr, fStatus)
+
+	port, err := parseServePort(portStr)
+	if err != nil {
+		return fmt.Errorf("invalid port %q: %w", portStr, err)
 	}
+
+	scheme := "https"
+	if sc.IsServingHTTP(port) {
+		scheme = "http"
+	}
+
+	portPart := ":" + portStr
+	if scheme == "http" && portStr == "80" ||
+		scheme == "https" && portStr == "443" {
+		portPart = ""
+	}
+	if scheme == "http" {
+		hostname, _, _ := strings.Cut(host, ".")
+		printf("%s://%s%s (%s)\n", scheme, hostname, portPart, fStatus)
+	}
+	printf("%s://%s%s (%s)\n", scheme, host, portPart, fStatus)
 	srvTypeAndDesc := func(h *ipn.HTTPHandler) (string, string) {
 		switch {
 		case h.Path != "":
@@ -675,6 +753,8 @@ func printWebStatusTree(sc *ipn.ServeConfig, hp ipn.HostPort) {
 		t, d := srvTypeAndDesc(h)
 		printf("%s %s%s %-5s %s\n", "|--", m, strings.Repeat(" ", maxLen-len(m)), t, d)
 	}
+
+	return nil
 }
 
 func elipticallyTruncate(s string, max int) string {
@@ -682,4 +762,101 @@ func elipticallyTruncate(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+// runServeReset clears out the current serve config.
+//
+// Usage:
+//   - tailscale serve reset
+func (e *serveEnv) runServeReset(ctx context.Context, args []string) error {
+	if len(args) != 0 {
+		return flag.ErrHelp
+	}
+	sc := new(ipn.ServeConfig)
+	return e.lc.SetServeConfig(ctx, sc)
+}
+
+// parseServePort parses a port number from a string and returns it as a
+// uint16. It returns an error if the port number is invalid or zero.
+func parseServePort(s string) (uint16, error) {
+	p, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		return 0, err
+	}
+	if p == 0 {
+		return 0, errors.New("port number must be non-zero")
+	}
+	return uint16(p), nil
+}
+
+// enableFeatureInteractive sends the node's user through an interactive
+// flow to enable a feature, such as Funnel, on their tailnet.
+//
+// hasRequiredCapabilities should be provided as a function that checks
+// whether a slice of node capabilities encloses the necessary values
+// needed to use the feature.
+//
+// If err is returned empty, the feature has been successfully enabled.
+//
+// If err is returned non-empty, the client failed to query the control
+// server for information about how to enable the feature.
+//
+// If the feature cannot be enabled, enableFeatureInteractive terminates
+// the CLI process.
+//
+// 2023-08-09: The only valid feature values are "serve" and "funnel".
+// This can be moved to some CLI lib when expanded past serve/funnel.
+func (e *serveEnv) enableFeatureInteractive(ctx context.Context, feature string, hasRequiredCapabilities func(caps []string) bool) (err error) {
+	info, err := e.lc.QueryFeature(ctx, feature)
+	if err != nil {
+		return err
+	}
+	if info.Complete {
+		return nil // already enabled
+	}
+	if info.Text != "" {
+		fmt.Fprintln(os.Stdout, "\n"+info.Text)
+	}
+	if info.URL != "" {
+		fmt.Fprintln(os.Stdout, "\n         "+info.URL+"\n")
+	}
+	if !info.ShouldWait {
+		e.lc.IncrementCounter(ctx, fmt.Sprintf("%s_not_awaiting_enablement", feature), 1)
+		// The feature has not been enabled yet,
+		// but the CLI should not block on user action.
+		// Once info.Text is printed, exit the CLI.
+		os.Exit(0)
+	}
+	e.lc.IncrementCounter(ctx, fmt.Sprintf("%s_awaiting_enablement", feature), 1)
+	// Block until feature is enabled.
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	defer cancelWatch()
+	watcher, err := e.lc.WatchIPNBus(watchCtx, 0)
+	if err != nil {
+		// If we fail to connect to the IPN notification bus,
+		// don't block. We still present the URL in the CLI,
+		// then close the process. Swallow the error.
+		log.Fatalf("lost connection to tailscaled: %v", err)
+		e.lc.IncrementCounter(ctx, fmt.Sprintf("%s_enablement_lost_connection", feature), 1)
+		return err
+	}
+	defer watcher.Close()
+	for {
+		n, err := watcher.Next()
+		if err != nil {
+			// Stop blocking if we error.
+			// Let the user finish enablement then rerun their
+			// command themselves.
+			log.Fatalf("lost connection to tailscaled: %v", err)
+			e.lc.IncrementCounter(ctx, fmt.Sprintf("%s_enablement_lost_connection", feature), 1)
+			return err
+		}
+		if nm := n.NetMap; nm != nil && nm.SelfNode != nil {
+			if hasRequiredCapabilities(nm.SelfNode.Capabilities) {
+				e.lc.IncrementCounter(ctx, fmt.Sprintf("%s_enabled", feature), 1)
+				fmt.Fprintln(os.Stdout, "Success.")
+				return nil
+			}
+		}
+	}
 }

@@ -6,6 +6,7 @@
 package ipn
 
 import (
+	"maps"
 	"net/netip"
 
 	"tailscale.com/tailcfg"
@@ -73,12 +74,7 @@ func (src *ServeConfig) Clone() *ServeConfig {
 			dst.Web[k] = v.Clone()
 		}
 	}
-	if dst.AllowFunnel != nil {
-		dst.AllowFunnel = map[HostPort]bool{}
-		for k, v := range src.AllowFunnel {
-			dst.AllowFunnel[k] = v
-		}
-	}
+	dst.AllowFunnel = maps.Clone(src.AllowFunnel)
 	return dst
 }
 
@@ -103,6 +99,7 @@ func (src *TCPPortHandler) Clone() *TCPPortHandler {
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _TCPPortHandlerCloneNeedsRegeneration = TCPPortHandler(struct {
 	HTTPS        bool
+	HTTP         bool
 	TCPForward   string
 	TerminateTLS string
 }{})

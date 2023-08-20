@@ -121,6 +121,11 @@ type NetworkLockStatus struct {
 	// (i.e. no connectivity) because they failed tailnet lock
 	// checks.
 	FilteredPeers []*TKAFilteredPeer
+
+	// StateID is a nonce associated with the network lock authority,
+	// generated upon enablement. This field is not populated if the
+	// network lock is disabled.
+	StateID uint64
 }
 
 // NetworkLockUpdate describes a change to network-lock state.
@@ -194,6 +199,10 @@ type PeerStatus struct {
 	OS      string // HostInfo.OS
 	UserID  tailcfg.UserID
 
+	// AltSharerUserID is the user who shared this node
+	// if it's different than UserID. Otherwise it's zero.
+	AltSharerUserID tailcfg.UserID `json:",omitempty"`
+
 	// TailscaleIPs are the IP addresses assigned to the node.
 	TailscaleIPs []netip.Addr
 
@@ -204,7 +213,7 @@ type PeerStatus struct {
 	// PrimaryRoutes are the routes this node is currently the primary
 	// subnet router for, as determined by the control plane. It does
 	// not include the IPs in TailscaleIPs.
-	PrimaryRoutes *views.IPPrefixSlice `json:",omitempty"`
+	PrimaryRoutes *views.Slice[netip.Prefix] `json:",omitempty"`
 
 	// Endpoints:
 	Addrs   []string
@@ -218,9 +227,8 @@ type PeerStatus struct {
 	LastSeen       time.Time // last seen to tailcontrol; only present if offline
 	LastHandshake  time.Time // with local wireguard
 	Online         bool      // whether node is connected to the control plane
-	KeepAlive      bool
-	ExitNode       bool // true if this is the currently selected exit node.
-	ExitNodeOption bool // true if this node can be an exit node (offered && approved)
+	ExitNode       bool      // true if this is the currently selected exit node.
+	ExitNodeOption bool      // true if this node can be an exit node (offered && approved)
 
 	// Active is whether the node was recently active. The
 	// definition is somewhat undefined but has historically and
@@ -269,6 +277,8 @@ type PeerStatus struct {
 	// KeyExpiry, if present, is the time at which the node key expired or
 	// will expire.
 	KeyExpiry *time.Time `json:",omitempty"`
+
+	Location *tailcfg.Location `json:",omitempty"`
 }
 
 type StatusBuilder struct {
@@ -381,6 +391,9 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	if v := st.UserID; v != 0 {
 		e.UserID = v
 	}
+	if v := st.AltSharerUserID; v != 0 {
+		e.AltSharerUserID = v
+	}
 	if v := st.TailscaleIPs; v != nil {
 		e.TailscaleIPs = v
 	}
@@ -432,9 +445,6 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	if st.InEngine {
 		e.InEngine = true
 	}
-	if st.KeepAlive {
-		e.KeepAlive = true
-	}
 	if st.ExitNode {
 		e.ExitNode = true
 	}
@@ -456,6 +466,7 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	if t := st.KeyExpiry; t != nil {
 		e.KeyExpiry = ptr.To(*t)
 	}
+	e.Location = st.Location
 }
 
 type StatusUpdater interface {
@@ -583,6 +594,8 @@ func osEmoji(os string) string {
 		return "🖥️"
 	case "iOS":
 		return "📱"
+	case "tvOS":
+		return "🍎📺"
 	case "android":
 		return "🤖"
 	case "freebsd":

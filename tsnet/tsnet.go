@@ -12,7 +12,6 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -22,12 +21,13 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/slices"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
@@ -41,31 +41,36 @@ import (
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/logtail/filch"
-	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/memnet"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/smallzstd"
+	"tailscale.com/tsd"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/nettype"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/testenv"
 	"tailscale.com/wgengine"
-	"tailscale.com/wgengine/monitor"
 	"tailscale.com/wgengine/netstack"
 )
 
-func inTest() bool { return flag.Lookup("test.v") != nil }
-
 // Server is an embedded Tailscale server.
 //
-// Its exported fields may be changed until the first call to Listen.
+// Its exported fields may be changed until the first method call.
 type Server struct {
 	// Dir specifies the name of the directory to use for
 	// state. If empty, a directory is selected automatically
 	// under os.UserConfigDir (https://golang.org/pkg/os/#UserConfigDir).
 	// based on the name of the binary.
+	//
+	// If you want to use multiple tsnet services in the same
+	// binary, you will need to make sure that Dir is set uniquely
+	// for each service. A good pattern for this is to have a
+	// "base" directory (such as your mutable storage folder) and
+	// then append the hostname on the end of it.
 	Dir string
 
 	// Store specifies the state store to use.
@@ -73,7 +78,7 @@ type Server struct {
 	// If nil, a new FileStore is initialized at `Dir/tailscaled.state`.
 	// See tailscale.com/ipn/store for supported stores.
 	//
-	// Logs will automatically be uploaded to uploaded to log.tailscale.io,
+	// Logs will automatically be uploaded to log.tailscale.io,
 	// where the configuration file for logging will be saved at
 	// `Dir/tailscaled.log.conf`.
 	Store ipn.StateStore
@@ -101,13 +106,18 @@ type Server struct {
 	// If empty, the Tailscale default is used.
 	ControlURL string
 
+	// Port is the UDP port to listen on for WireGuard and peer-to-peer
+	// traffic. If zero, a port is automatically selected. Leave this
+	// field at zero unless you know what you are doing.
+	Port uint16
+
 	getCertForTesting func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
 	initOnce         sync.Once
 	initErr          error
 	lb               *ipnlocal.LocalBackend
 	netstack         *netstack.Impl
-	linkMon          *monitor.Mon
+	netMon           *netmon.Monitor
 	rootPath         string // the state directory
 	hostname         string
 	shutdownCtx      context.Context
@@ -204,7 +214,7 @@ func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err er
 		// out the CONNECT code from tailscaled/proxy.go that uses
 		// httputil.ReverseProxy and adding auth support.
 		go func() {
-			lah := localapi.NewHandler(s.lb, s.logf, s.logid)
+			lah := localapi.NewHandler(s.lb, s.logf, s.netMon, s.logid)
 			lah.PermitWrite = true
 			lah.PermitRead = true
 			lah.RequiredPassword = s.localAPICred
@@ -357,8 +367,8 @@ func (s *Server) Close() error {
 	if s.lb != nil {
 		s.lb.Shutdown()
 	}
-	if s.linkMon != nil {
-		s.linkMon.Close()
+	if s.netMon != nil {
+		s.netMon.Close()
 	}
 	if s.dialer != nil {
 		s.dialer.Close()
@@ -435,7 +445,16 @@ func (s *Server) start() (reterr error) {
 
 	exe, err := os.Executable()
 	if err != nil {
-		return err
+		switch runtime.GOOS {
+		case "js", "wasip1":
+			// These platforms don't implement os.Executable (at least as of Go
+			// 1.21), but we don't really care much: it's only used as a default
+			// directory and hostname when they're not supplied. But we can fall
+			// back to "tsnet" as well.
+			exe = "tsnet"
+		default:
+			return err
+		}
 	}
 	prog := strings.TrimSuffix(strings.ToLower(filepath.Base(exe)), ".exe")
 
@@ -477,29 +496,27 @@ func (s *Server) start() (reterr error) {
 		return err
 	}
 
-	s.linkMon, err = monitor.New(logf)
+	s.netMon, err = netmon.New(logf)
 	if err != nil {
 		return err
 	}
-	closePool.add(s.linkMon)
+	closePool.add(s.netMon)
 
+	sys := new(tsd.System)
 	s.dialer = &tsdial.Dialer{Logf: logf} // mutated below (before used)
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
-		ListenPort:  0,
-		LinkMonitor: s.linkMon,
-		Dialer:      s.dialer,
+		ListenPort:   s.Port,
+		NetMon:       s.netMon,
+		Dialer:       s.dialer,
+		SetSubsystem: sys.Set,
 	})
 	if err != nil {
 		return err
 	}
 	closePool.add(s.dialer)
+	sys.Set(eng)
 
-	tunDev, magicConn, dns, ok := eng.(wgengine.InternalsGetter).GetInternals()
-	if !ok {
-		return fmt.Errorf("%T is not a wgengine.InternalsGetter", eng)
-	}
-
-	ns, err := netstack.Create(logf, tunDev, eng, magicConn, s.dialer, dns)
+	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get())
 	if err != nil {
 		return fmt.Errorf("netstack.Create: %w", err)
 	}
@@ -523,12 +540,13 @@ func (s *Server) start() (reterr error) {
 			return err
 		}
 	}
+	sys.Set(s.Store)
 
 	loginFlags := controlclient.LoginDefault
 	if s.Ephemeral {
 		loginFlags = controlclient.LoginEphemeral
 	}
-	lb, err := ipnlocal.NewLocalBackend(logf, s.logid, s.Store, s.dialer, eng, loginFlags)
+	lb, err := ipnlocal.NewLocalBackend(logf, s.logid, sys, loginFlags)
 	if err != nil {
 		return fmt.Errorf("NewLocalBackend: %v", err)
 	}
@@ -565,7 +583,7 @@ func (s *Server) start() (reterr error) {
 	go s.printAuthURLLoop()
 
 	// Run the localapi handler, to allow fetching LetsEncrypt certs.
-	lah := localapi.NewHandler(lb, logf, s.logid)
+	lah := localapi.NewHandler(lb, logf, s.netMon, s.logid)
 	lah.PermitWrite = true
 	lah.PermitRead = true
 
@@ -585,7 +603,7 @@ func (s *Server) start() (reterr error) {
 }
 
 func (s *Server) startLogger(closePool *closeOnErrorPool) error {
-	if inTest() {
+	if testenv.InTest() {
 		return nil
 	}
 	cfgPath := filepath.Join(s.rootPath, "tailscaled.log.conf")
@@ -621,7 +639,7 @@ func (s *Server) startLogger(closePool *closeOnErrorPool) error {
 			}
 			return w
 		},
-		HTTPC: &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost)},
+		HTTPC: &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost, s.netMon, s.logf)},
 	}
 	s.logtail = logtail.NewLogger(c, s.logf)
 	closePool.addFunc(func() { s.logtail.Shutdown(context.Background()) })
@@ -640,7 +658,7 @@ func (p closeOnErrorPool) closeAllIfError(errp *error) {
 	}
 }
 
-func (s *Server) logf(format string, a ...interface{}) {
+func (s *Server) logf(format string, a ...any) {
 	if s.logtail != nil {
 		s.logtail.Logf(format, a...)
 	}
@@ -649,25 +667,6 @@ func (s *Server) logf(format string, a ...interface{}) {
 		return
 	}
 	log.Printf(format, a...)
-}
-
-// ReplaceGlobalLoggers will replace any Tailscale-specific package-global
-// loggers with this Server's logger. It returns a function that, when called,
-// will undo any changes made.
-//
-// Note that calling this function from multiple Servers will result in the
-// last call taking all logs; logs are not duplicated.
-func (s *Server) ReplaceGlobalLoggers() (undo func()) {
-	var undos []func()
-
-	oldDnsFallback := dnsfallback.SetLogger(s.logf)
-	undos = append(undos, func() { dnsfallback.SetLogger(oldDnsFallback) })
-
-	return func() {
-		for _, fn := range undos {
-			fn()
-		}
-	}
 }
 
 // printAuthURLLoop loops once every few seconds while the server is still running and
@@ -929,6 +928,10 @@ func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.L
 	if err != nil {
 		return nil, err
 	}
+	// TODO(sonia,tailscale/corp#10577): We may want to use the interactive enable
+	// flow here instead of CheckFunnelAccess to allow the user to turn on Funnel
+	// if not already on. Specifically when running from a terminal.
+	// See cli.serveEnv.verifyFunnelEnabled.
 	if err := ipn.CheckFunnelAccess(uint16(port), st.Self.Capabilities); err != nil {
 		return nil, err
 	}

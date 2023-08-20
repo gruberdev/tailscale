@@ -17,15 +17,11 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/dns"
-	"tailscale.com/net/dns/resolver"
-	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
-	"tailscale.com/wgengine/magicsock"
-	"tailscale.com/wgengine/monitor"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 )
@@ -123,11 +119,8 @@ func (e *watchdogEngine) watchdog(name string, fn func()) {
 	})
 }
 
-func (e *watchdogEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config, debug *tailcfg.Debug) error {
-	return e.watchdogErr("Reconfig", func() error { return e.wrap.Reconfig(cfg, routerCfg, dnsCfg, debug) })
-}
-func (e *watchdogEngine) GetLinkMonitor() *monitor.Mon {
-	return e.wrap.GetLinkMonitor()
+func (e *watchdogEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config) error {
+	return e.watchdogErr("Reconfig", func() error { return e.wrap.Reconfig(cfg, routerCfg, dnsCfg) })
 }
 func (e *watchdogEngine) GetFilter() *filter.Filter {
 	return e.wrap.GetFilter()
@@ -165,8 +158,8 @@ func (e *watchdogEngine) DiscoPublicKey() (k key.DiscoPublic) {
 	e.watchdog("DiscoPublicKey", func() { k = e.wrap.DiscoPublicKey() })
 	return k
 }
-func (e *watchdogEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, cb func(*ipnstate.PingResult)) {
-	e.watchdog("Ping", func() { e.wrap.Ping(ip, pingType, cb) })
+func (e *watchdogEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size int, cb func(*ipnstate.PingResult)) {
+	e.watchdog("Ping", func() { e.wrap.Ping(ip, pingType, size, cb) })
 }
 func (e *watchdogEngine) RegisterIPPortIdentity(ipp netip.AddrPort, tsIP netip.Addr) {
 	e.watchdog("RegisterIPPortIdentity", func() { e.wrap.RegisterIPPortIdentity(ipp, tsIP) })
@@ -180,18 +173,6 @@ func (e *watchdogEngine) WhoIsIPPort(ipp netip.AddrPort) (tsIP netip.Addr, ok bo
 }
 func (e *watchdogEngine) Close() {
 	e.watchdog("Close", e.wrap.Close)
-}
-func (e *watchdogEngine) GetInternals() (tw *tstun.Wrapper, c *magicsock.Conn, d *dns.Manager, ok bool) {
-	if ig, ok := e.wrap.(InternalsGetter); ok {
-		return ig.GetInternals()
-	}
-	return
-}
-func (e *watchdogEngine) GetResolver() (r *resolver.Resolver, ok bool) {
-	if re, ok := e.wrap.(ResolvingEngine); ok {
-		return re.GetResolver()
-	}
-	return nil, false
 }
 func (e *watchdogEngine) PeerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 	e.watchdog("PeerForIP", func() { ret, ok = e.wrap.PeerForIP(ip) })

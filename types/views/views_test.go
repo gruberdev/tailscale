@@ -16,10 +16,10 @@ import (
 
 type viewStruct struct {
 	Int        int
-	Addrs      IPPrefixSlice
+	Addrs      Slice[netip.Prefix]
 	Strings    Slice[string]
-	AddrsPtr   *IPPrefixSlice `json:",omitempty"`
-	StringsPtr *Slice[string] `json:",omitempty"`
+	AddrsPtr   *Slice[netip.Prefix] `json:",omitempty"`
+	StringsPtr *Slice[string]       `json:",omitempty"`
 }
 
 func BenchmarkSliceIteration(b *testing.B) {
@@ -66,7 +66,7 @@ func TestViewsJSON(t *testing.T) {
 		}
 		return
 	}
-	ipp := IPPrefixSliceOf(mustCIDR("192.168.0.0/24"))
+	ipp := SliceOf(mustCIDR("192.168.0.0/24"))
 	ss := SliceOf([]string{"bar"})
 	tests := []struct {
 		name     string
@@ -128,4 +128,25 @@ func TestViewUtils(t *testing.T) {
 	c.Check(SliceEqualAnyOrder(v, SliceOf([]string{"bar", "foo"})), qt.Equals, true)
 	c.Check(SliceEqualAnyOrder(v, SliceOf([]string{"foo"})), qt.Equals, false)
 	c.Check(SliceEqualAnyOrder(SliceOf([]string{"a", "a", "b"}), SliceOf([]string{"a", "b", "b"})), qt.Equals, false)
+
+	c.Check(SliceEqualAnyOrder(
+		SliceOf([]string{"a", "b", "c"}).SliceFrom(1),
+		SliceOf([]string{"b", "c"})),
+		qt.Equals, true)
+	c.Check(SliceEqualAnyOrder(
+		SliceOf([]string{"a", "b", "c"}).Slice(1, 2),
+		SliceOf([]string{"b", "c"}).SliceTo(1)),
+		qt.Equals, true)
+}
+
+func TestLenIter(t *testing.T) {
+	orig := []string{"foo", "bar"}
+	var got []string
+	v := SliceOf(orig)
+	for i := range v.LenIter() {
+		got = append(got, v.At(i))
+	}
+	if !reflect.DeepEqual(orig, got) {
+		t.Errorf("got %q; want %q", got, orig)
+	}
 }

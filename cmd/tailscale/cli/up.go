@@ -6,18 +6,19 @@ package cli
 import (
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,10 +27,12 @@ import (
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	qrcode "github.com/skip2/go-qrcode"
+	"golang.org/x/oauth2/clientcredentials"
+	"tailscale.com/client/tailscale"
 	"tailscale.com/health/healthmsg"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/net/tsaddr"
+	"tailscale.com/net/netutil"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
@@ -86,8 +89,6 @@ func acceptRouteDefault(goos string) bool {
 }
 
 var upFlagSet = newUpFlagSet(effectiveGOOS(), &upArgsGlobal, "up")
-
-func inTest() bool { return flag.Lookup("test.v") != nil }
 
 // newUpFlagSet returns a new flag set for the "up" and "login" commands.
 func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
@@ -218,82 +219,6 @@ func warnf(format string, args ...any) {
 	printf("Warning: "+format+"\n", args...)
 }
 
-var (
-	ipv4default = netip.MustParsePrefix("0.0.0.0/0")
-	ipv6default = netip.MustParsePrefix("::/0")
-)
-
-func validateViaPrefix(ipp netip.Prefix) error {
-	if !tsaddr.IsViaPrefix(ipp) {
-		return fmt.Errorf("%v is not a 4-in-6 prefix", ipp)
-	}
-	if ipp.Bits() < (128 - 32) {
-		return fmt.Errorf("%v 4-in-6 prefix must be at least a /%v", ipp, 128-32)
-	}
-	a := ipp.Addr().As16()
-	// The first 64 bits of a are the via prefix.
-	// The next 32 bits are the "site ID".
-	// The last 32 bits are the IPv4.
-	// For now, we reserve the top 3 bytes of the site ID,
-	// and only allow users to use site IDs 0-255.
-	siteID := binary.BigEndian.Uint32(a[8:12])
-	if siteID > 0xFF {
-		return fmt.Errorf("route %v contains invalid site ID %08x; must be 0xff or less", ipp, siteID)
-	}
-	return nil
-}
-
-func calcAdvertiseRoutes(advertiseRoutes string, advertiseDefaultRoute bool) ([]netip.Prefix, error) {
-	routeMap := map[netip.Prefix]bool{}
-	if advertiseRoutes != "" {
-		var default4, default6 bool
-		advroutes := strings.Split(advertiseRoutes, ",")
-		for _, s := range advroutes {
-			ipp, err := netip.ParsePrefix(s)
-			if err != nil {
-				return nil, fmt.Errorf("%q is not a valid IP address or CIDR prefix", s)
-			}
-			if ipp != ipp.Masked() {
-				return nil, fmt.Errorf("%s has non-address bits set; expected %s", ipp, ipp.Masked())
-			}
-			if tsaddr.IsViaPrefix(ipp) {
-				if err := validateViaPrefix(ipp); err != nil {
-					return nil, err
-				}
-			}
-			if ipp == ipv4default {
-				default4 = true
-			} else if ipp == ipv6default {
-				default6 = true
-			}
-			routeMap[ipp] = true
-		}
-		if default4 && !default6 {
-			return nil, fmt.Errorf("%s advertised without its IPv6 counterpart, please also advertise %s", ipv4default, ipv6default)
-		} else if default6 && !default4 {
-			return nil, fmt.Errorf("%s advertised without its IPv4 counterpart, please also advertise %s", ipv6default, ipv4default)
-		}
-	}
-	if advertiseDefaultRoute {
-		routeMap[netip.MustParsePrefix("0.0.0.0/0")] = true
-		routeMap[netip.MustParsePrefix("::/0")] = true
-	}
-	if len(routeMap) == 0 {
-		return nil, nil
-	}
-	routes := make([]netip.Prefix, 0, len(routeMap))
-	for r := range routeMap {
-		routes = append(routes, r)
-	}
-	sort.Slice(routes, func(i, j int) bool {
-		if routes[i].Bits() != routes[j].Bits() {
-			return routes[i].Bits() < routes[j].Bits()
-		}
-		return routes[i].Addr().Less(routes[j].Addr())
-	})
-	return routes, nil
-}
-
 // prefsFromUpArgs returns the ipn.Prefs for the provided args.
 //
 // Note that the parameters upArgs and warnf are named intentionally
@@ -301,7 +226,7 @@ func calcAdvertiseRoutes(advertiseRoutes string, advertiseDefaultRoute bool) ([]
 // function exists for testing and should have no side effects or
 // outside interactions (e.g. no making Tailscale LocalAPI calls).
 func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goos string) (*ipn.Prefs, error) {
-	routes, err := calcAdvertiseRoutes(upArgs.advertiseRoutes, upArgs.advertiseDefaultRoute)
+	routes, err := netutil.CalcAdvertiseRoutes(upArgs.advertiseRoutes, upArgs.advertiseDefaultRoute)
 	if err != nil {
 		return nil, err
 	}
@@ -420,7 +345,7 @@ func updatePrefs(prefs, curPrefs *ipn.Prefs, env upCheckEnv) (simpleUp bool, jus
 
 	simpleUp = env.flagSet.NFlag() == 0 &&
 		curPrefs.Persist != nil &&
-		curPrefs.Persist.LoginName != "" &&
+		curPrefs.Persist.UserProfile.LoginName != "" &&
 		env.backendState != ipn.NeedsLogin.String()
 
 	justEdit := env.backendState == ipn.Running.String() &&
@@ -663,6 +588,10 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		if err != nil {
 			return err
 		}
+		authKey, err = resolveAuthKey(ctx, authKey, upArgs.advertiseTags)
+		if err != nil {
+			return err
+		}
 		if err := localClient.Start(ctx, ipn.Options{
 			AuthKey:     authKey,
 			UpdatePrefs: prefs,
@@ -717,7 +646,8 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 // the health check, rather than just a string.
 func upWorthyWarning(s string) bool {
 	return strings.Contains(s, healthmsg.TailscaleSSHOnBut) ||
-		strings.Contains(s, healthmsg.WarnAcceptRoutesOff)
+		strings.Contains(s, healthmsg.WarnAcceptRoutesOff) ||
+		strings.Contains(s, healthmsg.LockedOut)
 }
 
 func checkUpWarnings(ctx context.Context) {
@@ -1101,4 +1031,94 @@ func anyPeerAdvertisingRoutes(st *ipnstate.Status) bool {
 		}
 	}
 	return false
+}
+
+func init() {
+	// Required to use our client API. We're fine with the instability since the
+	// client lives in the same repo as this code.
+	tailscale.I_Acknowledge_This_API_Is_Unstable = true
+}
+
+// resolveAuthKey either returns v unchanged (in the common case) or, if it
+// starts with "tskey-client-" (as Tailscale OAuth secrets do) parses it like
+//
+//	tskey-client-xxxx[?ephemeral=false&bar&preauthorized=BOOL&baseURL=...]
+//
+// and does the OAuth2 dance to get and return an authkey. The "ephemeral"
+// property defaults to true if unspecified. The "preauthorized" defaults to
+// false. The "baseURL" defaults to https://api.tailscale.com.
+// The passed in tags are required, and must be non-empty. These will be
+// set on the authkey generated by the OAuth2 dance.
+func resolveAuthKey(ctx context.Context, v, tags string) (string, error) {
+	if !strings.HasPrefix(v, "tskey-client-") {
+		return v, nil
+	}
+	if tags == "" {
+		return "", errors.New("oauth authkeys require --advertise-tags")
+	}
+
+	clientSecret, named, _ := strings.Cut(v, "?")
+	attrs, err := url.ParseQuery(named)
+	if err != nil {
+		return "", err
+	}
+	for k := range attrs {
+		switch k {
+		case "ephemeral", "preauthorized", "baseURL":
+		default:
+			return "", fmt.Errorf("unknown attribute %q", k)
+		}
+	}
+	getBool := func(name string, def bool) (bool, error) {
+		v := attrs.Get(name)
+		if v == "" {
+			return def, nil
+		}
+		ret, err := strconv.ParseBool(v)
+		if err != nil {
+			return false, fmt.Errorf("invalid attribute boolean attribute %s value %q", name, v)
+		}
+		return ret, nil
+	}
+	ephemeral, err := getBool("ephemeral", true)
+	if err != nil {
+		return "", err
+	}
+	preauth, err := getBool("preauthorized", false)
+	if err != nil {
+		return "", err
+	}
+
+	baseURL := "https://api.tailscale.com"
+	if v := attrs.Get("baseURL"); v != "" {
+		baseURL = v
+	}
+
+	credentials := clientcredentials.Config{
+		ClientID:     "some-client-id", // ignored
+		ClientSecret: clientSecret,
+		TokenURL:     baseURL + "/api/v2/oauth/token",
+		Scopes:       []string{"device"},
+	}
+
+	tsClient := tailscale.NewClient("-", nil)
+	tsClient.HTTPClient = credentials.Client(ctx)
+	tsClient.BaseURL = baseURL
+
+	caps := tailscale.KeyCapabilities{
+		Devices: tailscale.KeyDeviceCapabilities{
+			Create: tailscale.KeyDeviceCreateCapabilities{
+				Reusable:      false,
+				Ephemeral:     ephemeral,
+				Preauthorized: preauth,
+				Tags:          strings.Split(tags, ","),
+			},
+		},
+	}
+
+	authkey, _, err := tsClient.CreateKey(ctx, caps)
+	if err != nil {
+		return "", err
+	}
+	return authkey, nil
 }

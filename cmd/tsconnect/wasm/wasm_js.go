@@ -37,6 +37,7 @@ import (
 	"tailscale.com/safesocket"
 	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsd"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/netstack"
 	"tailscale.com/words"
@@ -46,7 +47,7 @@ import (
 var ControlURL = ipn.DefaultControlURL
 
 func main() {
-	js.Global().Set("newIPN", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+	js.Global().Set("newIPN", js.FuncOf(func(this js.Value, args []js.Value) any {
 		if len(args) != 1 {
 			log.Fatal("Usage: newIPN(config)")
 			return nil
@@ -96,19 +97,19 @@ func newIPN(jsConfig js.Value) map[string]any {
 	logtail := logtail.NewLogger(c, log.Printf)
 	logf := logtail.Logf
 
+	sys := new(tsd.System)
+	sys.Set(store)
 	dialer := &tsdial.Dialer{Logf: logf}
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
-		Dialer: dialer,
+		Dialer:       dialer,
+		SetSubsystem: sys.Set,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
+	sys.Set(eng)
 
-	tunDev, magicConn, dnsManager, ok := eng.(wgengine.InternalsGetter).GetInternals()
-	if !ok {
-		log.Fatalf("%T is not a wgengine.InternalsGetter", eng)
-	}
-	ns, err := netstack.Create(logf, tunDev, eng, magicConn, dialer, dnsManager)
+	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), dialer, sys.DNSManager.Get())
 	if err != nil {
 		log.Fatalf("netstack.Create: %v", err)
 	}
@@ -121,10 +122,11 @@ func newIPN(jsConfig js.Value) map[string]any {
 	dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		return ns.DialContextTCP(ctx, dst)
 	}
+	sys.NetstackRouter.Set(true)
 
 	logid := lpc.PublicID
-	srv := ipnserver.New(logf, logid)
-	lb, err := ipnlocal.NewLocalBackend(logf, logid, store, dialer, eng, controlclient.LoginEphemeral)
+	srv := ipnserver.New(logf, logid, nil /* no netMon */)
+	lb, err := ipnlocal.NewLocalBackend(logf, logid, sys, controlclient.LoginEphemeral)
 	if err != nil {
 		log.Fatalf("ipnlocal.NewLocalBackend: %v", err)
 	}
@@ -146,7 +148,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 	}
 
 	return map[string]any{
-		"run": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"run": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 1 {
 				log.Fatal(`Usage: run({
 					notifyState(state: int): void,
@@ -159,7 +161,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 			jsIPN.run(args[0])
 			return nil
 		}),
-		"login": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"login": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 0 {
 				log.Printf("Usage: login()")
 				return nil
@@ -167,7 +169,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 			jsIPN.login()
 			return nil
 		}),
-		"logout": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"logout": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 0 {
 				log.Printf("Usage: logout()")
 				return nil
@@ -175,7 +177,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 			jsIPN.logout()
 			return nil
 		}),
-		"ssh": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"ssh": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 3 {
 				log.Printf("Usage: ssh(hostname, userName, termConfig)")
 				return nil
@@ -185,7 +187,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 				args[1].String(),
 				args[2])
 		}),
-		"fetch": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"fetch": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 1 {
 				log.Printf("Usage: fetch(url)")
 				return nil
@@ -255,21 +257,25 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 					},
 					MachineStatus: jsMachineStatus[nm.MachineStatus],
 				},
-				Peers: mapSlice(nm.Peers, func(p *tailcfg.Node) jsNetMapPeerNode {
-					name := p.Name
+				Peers: mapSlice(nm.Peers, func(p tailcfg.NodeView) jsNetMapPeerNode {
+					name := p.Name()
 					if name == "" {
 						// In practice this should only happen for Hello.
-						name = p.Hostinfo.Hostname()
+						name = p.Hostinfo().Hostname()
+					}
+					addrs := make([]string, p.Addresses().Len())
+					for i := range p.Addresses().LenIter() {
+						addrs[i] = p.Addresses().At(i).Addr().String()
 					}
 					return jsNetMapPeerNode{
 						jsNetMapNode: jsNetMapNode{
 							Name:       name,
-							Addresses:  mapSlice(p.Addresses, func(a netip.Prefix) string { return a.Addr().String() }),
-							MachineKey: p.Machine.String(),
-							NodeKey:    p.Key.String(),
+							Addresses:  addrs,
+							MachineKey: p.Machine().String(),
+							NodeKey:    p.Key().String(),
 						},
-						Online:              p.Online,
-						TailscaleSSHEnabled: p.Hostinfo.TailscaleSSHEnabled(),
+						Online:              p.Online(),
+						TailscaleSSHEnabled: p.Hostinfo().TailscaleSSHEnabled(),
 					}
 				}),
 				LockedOut: nm.TKAEnabled && len(nm.SelfNode.KeySignature) == 0,
@@ -334,10 +340,10 @@ func (i *jsIPN) ssh(host, username string, termConfig js.Value) map[string]any {
 	go jsSSHSession.Run()
 
 	return map[string]any{
-		"close": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"close": js.FuncOf(func(this js.Value, args []js.Value) any {
 			return jsSSHSession.Close() != nil
 		}),
-		"resize": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		"resize": js.FuncOf(func(this js.Value, args []js.Value) any {
 			rows := args[0].Int()
 			cols := args[1].Int()
 			return jsSSHSession.Resize(rows, cols) != nil
@@ -426,7 +432,7 @@ func (s *jsSSHSession) Run() {
 	session.Stdout = termWriter{writeFn}
 	session.Stderr = termWriter{writeFn}
 
-	setReadFn.Invoke(js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+	setReadFn.Invoke(js.FuncOf(func(this js.Value, args []js.Value) any {
 		input := args[0].String()
 		_, err := stdin.Write([]byte(input))
 		if err != nil {
@@ -496,7 +502,7 @@ func (i *jsIPN) fetch(url string) js.Value {
 		return map[string]any{
 			"status":     res.StatusCode,
 			"statusText": res.Status,
-			"text": js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+			"text": js.FuncOf(func(this js.Value, args []js.Value) any {
 				return makePromise(func() (any, error) {
 					defer res.Body.Close()
 					buf := new(bytes.Buffer)
@@ -602,7 +608,7 @@ func generateHostname() string {
 // f is run on a goroutine and its return value is used to resolve the promise
 // (or reject it if an error is returned).
 func makePromise(f func() (any, error)) js.Value {
-	handler := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+	handler := js.FuncOf(func(this js.Value, args []js.Value) any {
 		resolve := args[0]
 		reject := args[1]
 		go func() {

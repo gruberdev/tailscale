@@ -17,6 +17,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
@@ -297,14 +298,17 @@ func TestStateMachine(t *testing.T) {
 	c := qt.New(t)
 
 	logf := tstest.WhileTestRunningLogger(t)
+	sys := new(tsd.System)
 	store := new(testStateStorage)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, 0)
+	sys.Set(store)
+	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set)
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
 	t.Cleanup(e.Close)
+	sys.Set(e)
 
-	b, err := NewLocalBackend(logf, logid.PublicID{}, store, nil, e, 0)
+	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
@@ -472,7 +476,6 @@ func TestStateMachine(t *testing.T) {
 	// The backend should propagate this upward for the UI.
 	t.Logf("\n\nLoginFinished")
 	notifies.expect(3)
-	cc.persist.LoginName = "user1"
 	cc.persist.UserProfile.LoginName = "user1"
 	cc.persist.NodeID = "node1"
 	cc.send(nil, "", true, &netmap.NetworkMap{})
@@ -490,7 +493,7 @@ func TestStateMachine(t *testing.T) {
 		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
-		c.Assert(nn[1].Prefs.Persist().LoginName(), qt.Equals, "user1")
+		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName(), qt.Equals, "user1")
 		c.Assert(ipn.NeedsMachineAuth, qt.Equals, *nn[2].State)
 		c.Assert(ipn.NeedsMachineAuth, qt.Equals, b.State())
 	}
@@ -699,7 +702,6 @@ func TestStateMachine(t *testing.T) {
 	b.Login(nil)
 	t.Logf("\n\nLoginFinished3")
 	notifies.expect(3)
-	cc.persist.LoginName = "user2"
 	cc.persist.UserProfile.LoginName = "user2"
 	cc.persist.NodeID = "node2"
 	cc.send(nil, "", true, &netmap.NetworkMap{
@@ -713,7 +715,7 @@ func TestStateMachine(t *testing.T) {
 		c.Assert(nn[1].Prefs.Persist(), qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
 		// Prefs after finishing the login, so LoginName updated.
-		c.Assert(nn[1].Prefs.Persist().LoginName(), qt.Equals, "user2")
+		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName(), qt.Equals, "user2")
 		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsFalse)
 		c.Assert(nn[1].Prefs.WantRunning(), qt.IsTrue)
 		c.Assert(ipn.Starting, qt.Equals, *nn[2].State)
@@ -836,7 +838,6 @@ func TestStateMachine(t *testing.T) {
 	// interactive login, so we end up unpaused.
 	t.Logf("\n\nLoginDifferent URL visited")
 	notifies.expect(3)
-	cc.persist.LoginName = "user3"
 	cc.persist.UserProfile.LoginName = "user3"
 	cc.persist.NodeID = "node3"
 	cc.send(nil, "", true, &netmap.NetworkMap{
@@ -855,7 +856,7 @@ func TestStateMachine(t *testing.T) {
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
 		// Prefs after finishing the login, so LoginName updated.
-		c.Assert(nn[1].Prefs.Persist().LoginName(), qt.Equals, "user3")
+		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName(), qt.Equals, "user3")
 		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsFalse)
 		c.Assert(nn[1].Prefs.WantRunning(), qt.IsTrue)
 		c.Assert(ipn.Starting, qt.Equals, *nn[2].State)
@@ -941,13 +942,16 @@ func TestStateMachine(t *testing.T) {
 
 func TestEditPrefsHasNoKeys(t *testing.T) {
 	logf := tstest.WhileTestRunningLogger(t)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, 0)
+	sys := new(tsd.System)
+	sys.Set(new(mem.Store))
+	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set)
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
 	t.Cleanup(e.Close)
+	sys.Set(e)
 
-	b, err := NewLocalBackend(logf, logid.PublicID{}, new(mem.Store), nil, e, 0)
+	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
@@ -1023,10 +1027,14 @@ func TestWGEngineStatusRace(t *testing.T) {
 	t.Skip("test fails")
 	c := qt.New(t)
 	logf := tstest.WhileTestRunningLogger(t)
-	eng, err := wgengine.NewFakeUserspaceEngine(logf, 0)
+	sys := new(tsd.System)
+	sys.Set(new(mem.Store))
+
+	eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set)
 	c.Assert(err, qt.IsNil)
 	t.Cleanup(eng.Close)
-	b, err := NewLocalBackend(logf, logid.PublicID{}, new(mem.Store), nil, eng, 0)
+	sys.Set(eng)
+	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	c.Assert(err, qt.IsNil)
 
 	var cc *mockControl
