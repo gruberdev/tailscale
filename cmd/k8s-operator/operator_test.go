@@ -20,7 +20,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
 	"tailscale.com/client/tailscale"
 	"tailscale.com/types/ptr"
 )
@@ -886,12 +885,6 @@ func (c *fakeTSClient) CreateKey(ctx context.Context, caps tailscale.KeyCapabili
 }
 
 func (c *fakeTSClient) DeleteDevice(ctx context.Context, deviceID string) error {
-	c.Lock()
-	defer c.Unlock()
-	return nil
-}
-
-func (c *fakeTSClient) Device(ctx context.Context, deviceID string, fieldOpts tailscale.DeviceFieldsOpts) error {
 	c.Lock()
 	defer c.Unlock()
 	c.deleted = append(c.deleted, deviceID)
